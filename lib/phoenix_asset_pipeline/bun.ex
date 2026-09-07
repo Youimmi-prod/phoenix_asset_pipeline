@@ -6,12 +6,9 @@ defmodule PhoenixAssetPipeline.Bun do
   @compile {:no_warn_undefined, {CAStore, :file_path, 0}}
   @ensured_key {__MODULE__, :ensured}
   @fingerprint_chunk_size 1024 * 1024
+  @fingerprint_key {__MODULE__, :fingerprint}
   @install_lock {__MODULE__, :install}
-  @version Application.compile_env!(:phoenix_asset_pipeline, :bun_version)
-
-  if !(is_binary(@version) and Regex.match?(~r/^\d+\.\d+\.\d+$/, @version)) do
-    raise ArgumentError, ":bun_version for :phoenix_asset_pipeline must be an exact semantic version"
-  end
+  @version "1.4.2"
 
   @wrapper_script ~S"""
   const command = process.argv.slice(1);
@@ -159,15 +156,6 @@ defmodule PhoenixAssetPipeline.Bun do
     end
   end
 
-  defp ensure_unlocked! do
-    version = version()
-
-    case bin_version() do
-      {:ok, ^version} -> :ok
-      _ -> install!(version)
-    end
-  end
-
   defp ensure_once! do
     fingerprint = fingerprint()
 
@@ -181,15 +169,32 @@ defmodule PhoenixAssetPipeline.Bun do
     end
   end
 
+  defp ensure_unlocked! do
+    version = version()
+
+    case bin_version() do
+      {:ok, ^version} -> :ok
+      _ -> install!(version)
+    end
+  end
+
   defp ensured?(fingerprint) do
     :persistent_term.get(@ensured_key, nil) == fingerprint
   end
 
   defp executable_fingerprint(path) do
-    with {:ok, %{mode: mode, type: :regular}} <- File.stat(path),
-         {:ok, digest} <- sha256_file(path) do
-      {:sha256, mode, digest}
-    else
+    case File.stat(path, time: :posix) do
+      {:ok, %{type: :regular} = stat} ->
+        signature = {path, %{stat | atime: 0}}
+
+        case :persistent_term.get(@fingerprint_key, nil) do
+          {^signature, fingerprint} ->
+            fingerprint
+
+          _ ->
+            hash_executable(signature)
+        end
+
       {:ok, %{type: type}} ->
         {:invalid, type}
 
@@ -198,17 +203,22 @@ defmodule PhoenixAssetPipeline.Bun do
     end
   end
 
-  defp sha256_file(path) do
-    case File.open(path, [:read, :binary]) do
-      {:ok, file} ->
-        try do
-          hash_file(file, :crypto.hash_init(:sha256))
-        after
-          File.close(file)
-        end
+  defp executable_name do
+    case :os.type() do
+      {:win32, _} -> "bun.exe"
+      _ -> "bun"
+    end
+  end
 
-      {:error, reason} ->
-        {:error, reason}
+  defp hash_executable({path, stat} = signature) do
+    # Cache identifiable files only after their second-precision timestamps have settled.
+    cache? = stat.inode != 0 and max(stat.mtime, stat.ctime) < System.os_time(:second)
+
+    with {:ok, result} <- File.open(path, [:read, :binary], &hash_file(&1, :crypto.hash_init(:sha256))),
+         {:ok, digest} <- result do
+      fingerprint = {:sha256, stat.mode, digest}
+      if cache?, do: :persistent_term.put(@fingerprint_key, {signature, fingerprint})
+      fingerprint
     end
   end
 
@@ -253,13 +263,6 @@ defmodule PhoenixAssetPipeline.Bun do
     end
 
     :ok
-  end
-
-  defp executable_name do
-    case :os.type() do
-      {:win32, _} -> "bun.exe"
-      _ -> "bun"
-    end
   end
 
   defp linux_target(target, parts) do

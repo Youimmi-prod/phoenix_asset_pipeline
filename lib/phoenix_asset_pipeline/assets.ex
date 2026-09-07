@@ -94,6 +94,18 @@ defmodule PhoenixAssetPipeline.Assets do
     |> drop_nested_dirs()
   end
 
+  defp asset_signature_term({:asset, path, digest, _}), do: {:asset, path, digest}
+  defp asset_signature_term(term), do: term
+
+  defp asset_source_term(path, relative) do
+    content = File.read!(path)
+    digest = :erlang.md5(content)
+
+    if String.starts_with?(relative, "img/"),
+      do: {:asset, relative, digest, content},
+      else: {:asset, relative, digest}
+  end
+
   defp asset_source_terms(assets_dir) do
     assets_dir
     |> regular_files()
@@ -140,18 +152,6 @@ defmodule PhoenixAssetPipeline.Assets do
     end)
   end
 
-  defp asset_signature_term({:asset, path, digest, _}), do: {:asset, path, digest}
-  defp asset_signature_term(term), do: term
-
-  defp asset_source_term(path, relative) do
-    content = File.read!(path)
-    digest = :erlang.md5(content)
-
-    if String.starts_with?(relative, "img/"),
-      do: {:asset, relative, digest, content},
-      else: {:asset, relative, digest}
-  end
-
   defp file_digest(path) do
     case File.read(path) do
       {:ok, content} -> :erlang.md5(content)
@@ -163,9 +163,6 @@ defmodule PhoenixAssetPipeline.Assets do
   defp forward_path(path), do: String.replace(path, "\\", "/")
 
   defp project_dir(assets_dir), do: Path.dirname(Path.expand(assets_dir))
-
-  defp sprite_source_dirs(nil), do: []
-  defp sprite_source_dirs({_, sprites}), do: Sprites.source_dirs(sprites)
 
   defp regular_entry(_, "." <> _), do: []
   defp regular_entry(_, "node_modules"), do: []
@@ -200,6 +197,9 @@ defmodule PhoenixAssetPipeline.Assets do
   defp source_term(type, path, root) do
     {type, path |> Path.relative_to(root) |> forward_path(), file_digest(path)}
   end
+
+  defp sprite_source_dirs(nil), do: []
+  defp sprite_source_dirs({_, sprites}), do: Sprites.source_dirs(sprites)
 
   defp unique_assets(assets) do
     assets

@@ -6,7 +6,7 @@ defmodule Mix.Tasks.Compile.PhoenixAssetPipelinePrepare do
   alias PhoenixAssetPipeline.Config
   alias PhoenixAssetPipeline.HTML.ModuleClasses
 
-  @mode if(Config.manifest_mode() == :precompiled,
+  @mode if(Config.precompiled_manifest?(),
           do: :deterministic,
           else: :stable
         )

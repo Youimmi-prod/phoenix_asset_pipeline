@@ -11,7 +11,7 @@ defmodule PhoenixAssetPipeline.Manifest do
 
   alias PhoenixAssetPipeline.Config
 
-  @precompiled? Config.manifest_mode() == :precompiled
+  @precompiled? Config.precompiled_manifest?()
   @precompiled_module Module.concat(__MODULE__, Precompiled)
   @manifest_cache_file "asset_manifest.term"
   @snapshot_missing :__phoenix_asset_pipeline_manifest_snapshot_missing__
@@ -24,14 +24,15 @@ defmodule PhoenixAssetPipeline.Manifest do
   if @precompiled? do
     @compile {:no_warn_undefined, {@precompiled_module, :manifest, 0}}
 
-    @doc false
-    def start_link(_) do
-      ensure_precompiled!()
-      :ignore
+    @doc """
+    Reads a nested manifest value by section and key.
+    """
+    def find(term, key) do
+      case :maps.get(term, @precompiled_module.manifest(), nil) do
+        section when is_map(section) -> Map.get(section, key)
+        _ -> nil
+      end
     end
-
-    @impl true
-    def init(_), do: {:ok, nil}
 
     @doc """
     Reads a manifest value by key.
@@ -44,21 +45,22 @@ defmodule PhoenixAssetPipeline.Manifest do
       :maps.get(term, @precompiled_module.manifest(), default)
     end
 
-    @doc """
-    Reads a nested manifest value by section and key.
-    """
-    def find(term, key) do
-      case :maps.get(term, @precompiled_module.manifest(), nil) do
-        section when is_map(section) -> Map.get(section, key)
-        _ -> nil
-      end
-    end
+    @impl true
+    def init(_), do: {:ok, nil}
 
+    @doc false
+    def precompiled_loaded?, do: precompiled_module_loaded?()
     @doc false
     def put(manifest) when is_map(manifest), do: raise("the precompiled asset manifest is immutable")
 
     @doc false
     def put_compile_manifest(manifest) when is_map(manifest), do: put(manifest)
+
+    @doc false
+    def start_link(_) do
+      ensure_precompiled!()
+      :ignore
+    end
 
     defp ensure_precompiled! do
       if precompiled_module_loaded?() do
@@ -75,29 +77,19 @@ defmodule PhoenixAssetPipeline.Manifest do
     defp precompiled_module_loaded? do
       Code.ensure_loaded?(@precompiled_module) and function_exported?(@precompiled_module, :manifest, 0)
     end
-
-    @doc false
-    def precompiled_loaded?, do: precompiled_module_loaded?()
   else
     @current_generation_key :__phoenix_asset_pipeline_manifest_current_generation__
 
-    @doc false
-    def start_link(_) do
-      GenServer.start_link(__MODULE__, [], name: __MODULE__)
-    end
-
-    @impl true
-    def init(_) do
-      _ = :ets.new(__MODULE__, [:named_table, :protected, read_concurrency: true])
-
-      state = %{
-        generation: nil,
-        generation_refs: %{},
-        holders: %{},
-        retired: MapSet.new()
-      }
-
-      {:ok, load_initial_manifest(state)}
+    @doc """
+    Reads a nested manifest value by section and key.
+    """
+    def find(term, key) do
+      case snapshot() do
+        @snapshot_missing -> current_find(term, key)
+        {:generation, generation} -> generation_find(generation, term, key)
+        {:literal, manifest} -> map_find(manifest, term, key)
+        nil -> nil
+      end
     end
 
     @doc """
@@ -113,38 +105,6 @@ defmodule PhoenixAssetPipeline.Manifest do
         {:generation, generation} -> generation_get(generation, term, default)
         {:literal, manifest} -> Map.get(manifest, term, default)
         nil -> default
-      end
-    end
-
-    @doc """
-    Reads a nested manifest value by section and key.
-    """
-    def find(term, key) do
-      case snapshot() do
-        @snapshot_missing -> current_find(term, key)
-        {:generation, generation} -> generation_find(generation, term, key)
-        {:literal, manifest} -> map_find(manifest, term, key)
-        nil -> nil
-      end
-    end
-
-    @doc """
-    Replaces the stored manifest.
-    """
-    def put(manifest) when is_map(manifest) do
-      GenServer.call(__MODULE__, {:put, manifest})
-    end
-
-    @doc false
-    def put_compile_manifest(manifest) when is_map(manifest) do
-      if Process.whereis(__MODULE__) do
-        try do
-          put(manifest)
-        catch
-          :exit, _ -> :ok
-        end
-      else
-        :ok
       end
     end
 
@@ -171,6 +131,45 @@ defmodule PhoenixAssetPipeline.Manifest do
       {:noreply, release_holder(state, pid, ref)}
     end
 
+    @impl true
+    def init(_) do
+      _ = :ets.new(__MODULE__, [:named_table, :protected, read_concurrency: true])
+
+      state = %{
+        generation: nil,
+        generation_refs: %{},
+        holders: %{},
+        retired: MapSet.new()
+      }
+
+      {:ok, load_initial_manifest(state)}
+    end
+
+    @doc """
+    Replaces the stored manifest.
+    """
+    def put(manifest) when is_map(manifest) do
+      GenServer.call(__MODULE__, {:put, manifest})
+    end
+
+    @doc false
+    def put_compile_manifest(manifest) when is_map(manifest) do
+      if Process.whereis(__MODULE__) do
+        try do
+          put(manifest)
+        catch
+          :exit, _ -> :ok
+        end
+      else
+        :ok
+      end
+    end
+
+    @doc false
+    def start_link(_) do
+      GenServer.start_link(__MODULE__, [], name: __MODULE__)
+    end
+
     @cold_cache_key {__MODULE__, :cold_cache}
 
     @doc false
@@ -184,44 +183,6 @@ defmodule PhoenixAssetPipeline.Manifest do
           true
       end
     end
-
-    defp load_initial_manifest(state) do
-      replace_manifest(state, cold_manifest())
-    end
-
-    defp read_cached_manifest do
-      PhoenixAssetPipeline.Cache.read_term(cache_path(), :error, fn
-        manifest when is_map(manifest) ->
-          if valid?(manifest), do: {:ok, manifest}, else: :error
-
-        _ ->
-          :error
-      end)
-    end
-
-    defp read_cached_manifest! do
-      case read_cached_manifest() do
-        :error -> raise "missing or invalid cached asset manifest #{cache_path()}; run `mix compile`"
-        manifest -> manifest
-      end
-    end
-
-    defp cold_manifest do
-      case :persistent_term.get(@cold_cache_key, @storage_missing) do
-        @storage_missing ->
-          manifest = read_cached_manifest!()
-          :persistent_term.put(@cold_cache_key, manifest)
-          manifest
-
-        manifest ->
-          manifest
-      end
-    end
-
-    defp cold_find(term, key), do: map_find(cold_manifest(), term, key)
-    defp cold_get(term, default), do: Map.get(cold_manifest(), term, default)
-    defp cold_manifest_value(_default), do: cold_manifest()
-    defp cold_snapshot, do: {:literal, cold_manifest()}
 
     defp acquire_generation(state, pid, generation) do
       {monitor, generations} =
@@ -264,6 +225,24 @@ defmodule PhoenixAssetPipeline.Manifest do
 
       %{state | retired: retired}
     end
+
+    defp cold_find(term, key), do: map_find(cold_manifest(), term, key)
+    defp cold_get(term, default), do: Map.get(cold_manifest(), term, default)
+
+    defp cold_manifest do
+      case :persistent_term.get(@cold_cache_key, @storage_missing) do
+        @storage_missing ->
+          manifest = read_cached_manifest!()
+          :persistent_term.put(@cold_cache_key, manifest)
+          manifest
+
+        manifest ->
+          manifest
+      end
+    end
+
+    defp cold_manifest_value(_default), do: cold_manifest()
+    defp cold_snapshot, do: {:literal, cold_manifest()}
 
     defp current_find(term, key) do
       case current_generation() do
@@ -377,6 +356,14 @@ defmodule PhoenixAssetPipeline.Manifest do
       end)
     end
 
+    defp generation_section(generation, term) do
+      __MODULE__
+      |> :ets.match_object({{generation, term, :_}, :_})
+      |> Map.new(fn {{^generation, ^term, key}, value} -> {key, value} end)
+    rescue
+      ArgumentError -> %{}
+    end
+
     defp indexed_section?(term) do
       term in [
         :class_descriptors,
@@ -390,12 +377,8 @@ defmodule PhoenixAssetPipeline.Manifest do
       ]
     end
 
-    defp generation_section(generation, term) do
-      __MODULE__
-      |> :ets.match_object({{generation, term, :_}, :_})
-      |> Map.new(fn {{^generation, ^term, key}, value} -> {key, value} end)
-    rescue
-      ArgumentError -> %{}
+    defp load_initial_manifest(state) do
+      replace_manifest(state, cold_manifest())
     end
 
     defp lookup_element(key, default) do
@@ -408,6 +391,23 @@ defmodule PhoenixAssetPipeline.Manifest do
       case Map.get(manifest, term) do
         section when is_map(section) -> Map.get(section, key)
         _ -> nil
+      end
+    end
+
+    defp read_cached_manifest do
+      PhoenixAssetPipeline.Cache.read_term(cache_path(), :error, fn
+        manifest when is_map(manifest) ->
+          if valid?(manifest), do: {:ok, manifest}, else: :error
+
+        _ ->
+          :error
+      end)
+    end
+
+    defp read_cached_manifest! do
+      case read_cached_manifest() do
+        :error -> raise "missing or invalid cached asset manifest #{cache_path()}; run `mix compile`"
+        manifest -> manifest
       end
     end
 
@@ -540,6 +540,20 @@ defmodule PhoenixAssetPipeline.Manifest do
     end
   end
 
+  @doc """
+  Writes the manifest as a generated BEAM module for production releases.
+  """
+  def save_precompiled!(manifest, path \\ precompiled_beam_path()) when is_map(manifest) do
+    path
+    |> Path.dirname()
+    |> File.mkdir_p!()
+
+    PhoenixAssetPipeline.Cache.write_atomic!(path, precompiled_beam!(manifest))
+    register_precompiled_module!(path)
+
+    path
+  end
+
   @doc false
   def valid?(%{
         class_descriptors: class_descriptors,
@@ -563,20 +577,6 @@ defmodule PhoenixAssetPipeline.Manifest do
 
   def valid?(_), do: false
 
-  @doc """
-  Writes the manifest as a generated BEAM module for production releases.
-  """
-  def save_precompiled!(manifest, path \\ precompiled_beam_path()) when is_map(manifest) do
-    path
-    |> Path.dirname()
-    |> File.mkdir_p!()
-
-    PhoenixAssetPipeline.Cache.write_atomic!(path, precompiled_beam!(manifest))
-    register_precompiled_module!(path)
-
-    path
-  end
-
   if @precompiled? do
     def save_cached(_), do: raise("cached manifests are disabled in :precompiled mode")
   else
@@ -593,6 +593,167 @@ defmodule PhoenixAssetPipeline.Manifest do
   """
   def cache_path do
     Path.join(Config.manifest_cache_dir(), @manifest_cache_file)
+  end
+
+  defp binaries_valid?([value | values]) when is_binary(value), do: binaries_valid?(values)
+  defp binaries_valid?([]), do: true
+  defp binaries_valid?(_), do: false
+
+  defp class_descriptor_entries_valid?([{class_name, condition} | entries])
+       when is_binary(class_name) and is_integer(condition) do
+    class_descriptor_entries_valid?(entries)
+  end
+
+  defp class_descriptor_entries_valid?([]), do: true
+  defp class_descriptor_entries_valid?(_), do: false
+
+  defp class_descriptors_valid?(descriptors) when is_map(descriptors) do
+    Enum.all?(descriptors, fn
+      {{:string, hash}, {:precomputed, strings}} when is_binary(hash) and is_tuple(strings) ->
+        size = tuple_size(strings)
+        size > 0 and tuple_binaries_valid?(strings, 0, size)
+
+      {{:attr, hash}, {:precomputed, lists}} when is_binary(hash) and is_tuple(lists) ->
+        size = tuple_size(lists)
+        size > 0 and tuple_binary_lists_valid?(lists, 0, size)
+
+      {{kind, hash}, {:compact, entries}} when kind in [:string, :attr] and is_binary(hash) and is_list(entries) ->
+        class_descriptor_entries_valid?(entries)
+
+      _ ->
+        false
+    end)
+  end
+
+  defp class_descriptors_valid?(_), do: false
+
+  defp classes_valid?(classes) when is_map(classes) do
+    Enum.all?(classes, fn
+      {class_name, short_name} when is_binary(class_name) and is_binary(short_name) -> true
+      _ -> false
+    end)
+  end
+
+  defp classes_valid?(_), do: false
+
+  defp csp_directives_valid?(%{"script-src" => script_src, "style-src" => style_src} = directives)
+       when is_list(script_src) and is_list(style_src) do
+    Enum.all?(directives, fn
+      {directive, values} when is_binary(directive) and is_list(values) -> binaries_valid?(values)
+      _ -> false
+    end)
+  end
+
+  defp csp_directives_valid?(_), do: false
+
+  defp encoded_asset_data_valid?(%{"raw" => raw} = data) do
+    encoded_asset_entry_valid?(raw) and
+      Enum.all?(data, fn
+        {encoding, entry} when encoding in ["raw", "br", "deflate", "gzip", "zstd"] ->
+          encoded_asset_entry_valid?(entry)
+
+        _ ->
+          false
+      end)
+  end
+
+  defp encoded_asset_data_valid?(_), do: false
+
+  defp encoded_asset_entry_valid?({content, stored_size})
+       when is_binary(content) and is_integer(stored_size) and stored_size == byte_size(content), do: true
+
+  defp encoded_asset_entry_valid?(_), do: false
+
+  defp encoded_assets_valid?(assets) when is_map(assets) do
+    Enum.all?(assets, fn
+      {_, %{content_type: content_type, data: data, digest: digest}}
+      when is_binary(content_type) and is_map(data) and is_binary(digest) ->
+        encoded_asset_data_valid?(data)
+
+      _ ->
+        false
+    end)
+  end
+
+  defp encoded_assets_valid?(_), do: false
+
+  defp encoded_static_data_valid?(%{"raw" => raw} = data) do
+    encoded_static_entry_valid?(raw) and
+      Enum.all?(data, fn
+        {encoding, entry} when encoding in ["raw", "br", "deflate", "gzip", "zstd"] ->
+          encoded_static_entry_valid?(entry)
+
+        _ ->
+          false
+      end)
+  end
+
+  defp encoded_static_data_valid?(_), do: false
+
+  defp encoded_static_entry_valid?({content, stored_size, etag})
+       when is_binary(content) and is_integer(stored_size) and stored_size == byte_size(content) and is_binary(etag),
+       do: true
+
+  defp encoded_static_entry_valid?(_), do: false
+
+  defp image_sources_valid?(sources) when is_map(sources) do
+    Enum.all?(sources, fn
+      {source_path, %{digest: digest, path: path} = source} ->
+        is_binary(source_path) and is_binary(digest) and is_binary(path) and map_size(source) == 2
+
+      _ ->
+        false
+    end)
+  end
+
+  defp image_sources_valid?(_), do: false
+
+  defp manifest_assets_valid?(images, image_sources, scripts, script_tags, style_tags, static_files, csp_directives) do
+    encoded_assets_valid?(images) and
+      image_sources_valid?(image_sources) and
+      encoded_assets_valid?(scripts) and
+      script_tags_valid?(script_tags) and
+      style_tags_valid?(style_tags) and
+      static_files_valid?(static_files) and
+      csp_directives_valid?(csp_directives)
+  end
+
+  defp manifest_classes_valid?(classes, class_descriptors) do
+    classes_valid?(classes) and class_descriptors_valid?(class_descriptors)
+  end
+
+  defp manifest_metadata_valid?(digest, signature, static_signature, early_hints_preloads) do
+    is_binary(digest) and
+      is_binary(signature) and
+      is_binary(static_signature) and
+      binaries_valid?(early_hints_preloads)
+  end
+
+  @dialyzer {:nowarn_function, precompiled_beam!: 1}
+  defp precompiled_beam!(manifest) do
+    module = @precompiled_module
+    manifest_literal = :erl_parse.abstract(manifest)
+    anno = 0
+
+    forms = [
+      {:attribute, anno, :module, module},
+      {:attribute, anno, :export, [manifest: 0]},
+      {:function, anno, :manifest, 0, [{:clause, anno, [], [], [manifest_literal]}]}
+    ]
+
+    case :compile.forms(forms, [:binary, :return_errors, :return_warnings, :no_debug_info]) do
+      {:ok, ^module, binary} ->
+        binary
+
+      {:ok, ^module, binary, []} ->
+        binary
+
+      {:ok, ^module, _, warnings} ->
+        raise "precompiled asset manifest compiled with warnings: #{inspect(warnings)}"
+
+      {:error, errors, warnings} ->
+        raise "could not compile precompiled asset manifest: #{inspect(errors: errors, warnings: warnings)}"
+    end
   end
 
   defp precompiled_beam_path do
@@ -632,63 +793,36 @@ defmodule PhoenixAssetPipeline.Manifest do
     end
   end
 
-  defp manifest_metadata_valid?(digest, signature, static_signature, early_hints_preloads) do
-    is_binary(digest) and
-      is_binary(signature) and
-      is_binary(static_signature) and
-      binaries_valid?(early_hints_preloads)
-  end
-
-  defp manifest_classes_valid?(classes, class_descriptors) do
-    classes_valid?(classes) and class_descriptors_valid?(class_descriptors)
-  end
-
-  defp manifest_assets_valid?(images, image_sources, scripts, script_tags, style_tags, static_files, csp_directives) do
-    encoded_assets_valid?(images) and
-      image_sources_valid?(image_sources) and
-      encoded_assets_valid?(scripts) and
-      script_tags_valid?(script_tags) and
-      style_tags_valid?(style_tags) and
-      static_files_valid?(static_files) and
-      csp_directives_valid?(csp_directives)
-  end
-
-  defp classes_valid?(classes) when is_map(classes) do
-    Enum.all?(classes, fn
-      {class_name, short_name} when is_binary(class_name) and is_binary(short_name) -> true
+  defp script_tags_valid?(tags) when is_map(tags) do
+    Enum.all?(tags, fn
+      {_, %{integrity: integrity, path: path}} when is_binary(integrity) and is_binary(path) -> true
       _ -> false
     end)
   end
 
-  defp classes_valid?(_), do: false
+  defp script_tags_valid?(_), do: false
 
-  defp class_descriptors_valid?(descriptors) when is_map(descriptors) do
-    Enum.all?(descriptors, fn
-      {{:string, hash}, {:precomputed, strings}} when is_binary(hash) and is_tuple(strings) ->
-        size = tuple_size(strings)
-        size > 0 and tuple_binaries_valid?(strings, 0, size)
+  defp static_files_valid?(static_files) when is_map(static_files) do
+    Enum.all?(static_files, fn
+      {_, %{data: data}} when is_map(data) -> encoded_static_data_valid?(data)
+      _ -> false
+    end)
+  end
 
-      {{:attr, hash}, {:precomputed, lists}} when is_binary(hash) and is_tuple(lists) ->
-        size = tuple_size(lists)
-        size > 0 and tuple_binary_lists_valid?(lists, 0, size)
+  defp static_files_valid?(_), do: false
 
-      {{kind, hash}, {:compact, entries}} when kind in [:string, :attr] and is_binary(hash) and is_list(entries) ->
-        class_descriptor_entries_valid?(entries)
+  defp style_tags_valid?(tags) when is_map(tags) do
+    Enum.all?(tags, fn
+      {_, %{content: content, digest: digest, integrity: integrity}}
+      when is_binary(content) and is_binary(digest) and is_binary(integrity) ->
+        true
 
       _ ->
         false
     end)
   end
 
-  defp class_descriptors_valid?(_), do: false
-
-  defp class_descriptor_entries_valid?([{class_name, condition} | entries])
-       when is_binary(class_name) and is_integer(condition) do
-    class_descriptor_entries_valid?(entries)
-  end
-
-  defp class_descriptor_entries_valid?([]), do: true
-  defp class_descriptor_entries_valid?(_), do: false
+  defp style_tags_valid?(_), do: false
 
   defp tuple_binaries_valid?(_, size, size), do: true
 
@@ -704,144 +838,6 @@ defmodule PhoenixAssetPipeline.Manifest do
     case elem(tuple, index) do
       values when is_list(values) -> binaries_valid?(values) and tuple_binary_lists_valid?(tuple, index + 1, size)
       _ -> false
-    end
-  end
-
-  defp encoded_assets_valid?(assets) when is_map(assets) do
-    Enum.all?(assets, fn
-      {_, %{content_type: content_type, data: data, digest: digest}}
-      when is_binary(content_type) and is_map(data) and is_binary(digest) ->
-        encoded_asset_data_valid?(data)
-
-      _ ->
-        false
-    end)
-  end
-
-  defp encoded_assets_valid?(_), do: false
-
-  defp encoded_asset_data_valid?(%{"raw" => raw} = data) do
-    encoded_asset_entry_valid?(raw) and
-      Enum.all?(data, fn
-        {encoding, entry} when encoding in ["raw", "br", "deflate", "gzip", "zstd"] ->
-          encoded_asset_entry_valid?(entry)
-
-        _ ->
-          false
-      end)
-  end
-
-  defp encoded_asset_data_valid?(_), do: false
-
-  defp encoded_asset_entry_valid?({content, stored_size})
-       when is_binary(content) and is_integer(stored_size) and stored_size == byte_size(content), do: true
-
-  defp encoded_asset_entry_valid?(_), do: false
-
-  defp image_sources_valid?(sources) when is_map(sources) do
-    Enum.all?(sources, fn
-      {source_path, %{digest: digest, path: path, placeholder_path: placeholder_path} = source} ->
-        is_binary(source_path) and is_binary(digest) and is_binary(path) and is_binary(placeholder_path) and
-          map_size(source) == 3
-
-      {source_path, %{digest: digest, path: path} = source} ->
-        is_binary(source_path) and is_binary(digest) and is_binary(path) and map_size(source) == 2
-
-      _ ->
-        false
-    end)
-  end
-
-  defp image_sources_valid?(_), do: false
-
-  defp script_tags_valid?(tags) when is_map(tags) do
-    Enum.all?(tags, fn
-      {_, %{integrity: integrity, path: path}} when is_binary(integrity) and is_binary(path) -> true
-      _ -> false
-    end)
-  end
-
-  defp script_tags_valid?(_), do: false
-
-  defp style_tags_valid?(tags) when is_map(tags) do
-    Enum.all?(tags, fn
-      {_, %{content: content, digest: digest, integrity: integrity}}
-      when is_binary(content) and is_binary(digest) and is_binary(integrity) ->
-        true
-
-      _ ->
-        false
-    end)
-  end
-
-  defp style_tags_valid?(_), do: false
-
-  defp static_files_valid?(static_files) when is_map(static_files) do
-    Enum.all?(static_files, fn
-      {_, %{data: data}} when is_map(data) -> encoded_static_data_valid?(data)
-      _ -> false
-    end)
-  end
-
-  defp static_files_valid?(_), do: false
-
-  defp encoded_static_data_valid?(%{"raw" => raw} = data) do
-    encoded_static_entry_valid?(raw) and
-      Enum.all?(data, fn
-        {encoding, entry} when encoding in ["raw", "br", "deflate", "gzip", "zstd"] ->
-          encoded_static_entry_valid?(entry)
-
-        _ ->
-          false
-      end)
-  end
-
-  defp encoded_static_data_valid?(_), do: false
-
-  defp encoded_static_entry_valid?({content, stored_size, etag})
-       when is_binary(content) and is_integer(stored_size) and stored_size == byte_size(content) and is_binary(etag),
-       do: true
-
-  defp encoded_static_entry_valid?(_), do: false
-
-  defp csp_directives_valid?(%{"script-src" => script_src, "style-src" => style_src} = directives)
-       when is_list(script_src) and is_list(style_src) do
-    Enum.all?(directives, fn
-      {directive, values} when is_binary(directive) and is_list(values) -> binaries_valid?(values)
-      _ -> false
-    end)
-  end
-
-  defp csp_directives_valid?(_), do: false
-
-  defp binaries_valid?([value | values]) when is_binary(value), do: binaries_valid?(values)
-  defp binaries_valid?([]), do: true
-  defp binaries_valid?(_), do: false
-
-  @dialyzer {:nowarn_function, precompiled_beam!: 1}
-  defp precompiled_beam!(manifest) do
-    module = @precompiled_module
-    manifest_literal = :erl_parse.abstract(manifest)
-    anno = 0
-
-    forms = [
-      {:attribute, anno, :module, module},
-      {:attribute, anno, :export, [manifest: 0]},
-      {:function, anno, :manifest, 0, [{:clause, anno, [], [], [manifest_literal]}]}
-    ]
-
-    case :compile.forms(forms, [:binary, :return_errors, :return_warnings, :no_debug_info]) do
-      {:ok, ^module, binary} ->
-        binary
-
-      {:ok, ^module, binary, []} ->
-        binary
-
-      {:ok, ^module, _, warnings} ->
-        raise "precompiled asset manifest compiled with warnings: #{inspect(warnings)}"
-
-      {:error, errors, warnings} ->
-        raise "could not compile precompiled asset manifest: #{inspect(errors: errors, warnings: warnings)}"
     end
   end
 end

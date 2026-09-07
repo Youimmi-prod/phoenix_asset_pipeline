@@ -1,15 +1,7 @@
 import Config
 
-manifest_mode =
-  case config_env() do
-    :dev -> :cached
-    :test -> :cached
-    :prod -> :precompiled
-  end
+config :phoenix_asset_pipeline, otp_app: :phoenix_asset_pipeline
 
-config :phoenix_asset_pipeline,
-  bun_version: "1.4.0",
-  image_densities: [1, 2],
-  image_max_pixels: 40_000_000,
-  manifest_mode: manifest_mode,
-  otp_app: :phoenix_asset_pipeline
+if config_env() == :prod do
+  config :phoenix_asset_pipeline, precompiled_manifest: true
+end

@@ -33,6 +33,7 @@ defmodule PhoenixAssetPipeline.Plug.Static do
 
   import Plug.Conn,
     only: [
+      delete_resp_header: 2,
       get_req_header: 2,
       halt: 1,
       put_resp_content_type: 2,
@@ -44,6 +45,23 @@ defmodule PhoenixAssetPipeline.Plug.Static do
   alias PhoenixAssetPipeline.Manifest
 
   @allowed_methods ~w(GET HEAD)
+  @impl true
+  def call(%{method: method, path_info: [_ | _] = segments} = conn, %{only_rules: only_rules} = opts)
+      when method in @allowed_methods do
+    case static_asset_type(conn, segments) do
+      nil ->
+        if static_path?(only_rules, segments),
+          do: serve_static_file(conn, segments, opts),
+          else: conn
+
+      type ->
+        serve_static_asset(conn, segments, type, opts)
+    end
+  end
+
+  @impl true
+  def call(conn, _), do: conn
+
   @impl true
   def init(opts) do
     only =
@@ -63,22 +81,29 @@ defmodule PhoenixAssetPipeline.Plug.Static do
     }
   end
 
-  @impl true
-  def call(%{method: method, path_info: [_ | _] = segments} = conn, %{only_rules: only_rules} = opts)
-      when method in @allowed_methods do
-    case static_asset_type(conn, segments) do
-      nil ->
-        if static_path?(only_rules, segments),
-          do: serve_static_file(conn, segments, opts),
-          else: conn
+  defp accepted_encoding_value(value, acc) do
+    case :binary.match(value, ";") do
+      :nomatch ->
+        put_accepted_encoding(trim_ascii(value), 1000, acc)
 
-      type ->
-        serve_static_asset(conn, segments, type, opts)
+      {index, 1} ->
+        encoding = value |> binary_part(0, index) |> trim_ascii()
+        params = binary_part(value, index + 1, byte_size(value) - index - 1)
+        put_accepted_encoding(encoding, qvalue(params, 1000), acc)
     end
   end
 
-  @impl true
-  def call(conn, _), do: conn
+  defp accepted_encoding_values(header, acc) do
+    case :binary.match(header, ",") do
+      :nomatch ->
+        accepted_encoding_value(header, acc)
+
+      {index, 1} ->
+        encoding = binary_part(header, 0, index)
+        rest = binary_part(header, index + 1, byte_size(header) - index - 1)
+        accepted_encoding_values(rest, accepted_encoding_value(encoding, acc))
+    end
+  end
 
   defp accepted_encodings(["gzip, deflate, br, zstd" | rest], {_, _, _, _, wildcard, identity}) do
     accepted_encodings(rest, {1000, 1000, 1000, 1000, wildcard, identity})
@@ -98,33 +123,18 @@ defmodule PhoenixAssetPipeline.Plug.Static do
 
   defp accepted_encodings([], acc), do: acc
 
-  defp accepted_encoding_values(header, acc) do
-    case :binary.match(header, ",") do
-      :nomatch ->
-        accepted_encoding_value(header, acc)
-
-      {index, 1} ->
-        encoding = binary_part(header, 0, index)
-        rest = binary_part(header, index + 1, byte_size(header) - index - 1)
-        accepted_encoding_values(rest, accepted_encoding_value(encoding, acc))
-    end
-  end
-
-  defp accepted_encoding_value(value, acc) do
-    case :binary.match(value, ";") do
-      :nomatch ->
-        put_accepted_encoding(trim_ascii(value), 1000, acc)
-
-      {index, 1} ->
-        encoding = value |> binary_part(0, index) |> trim_ascii()
-        params = binary_part(value, index + 1, byte_size(value) - index - 1)
-        put_accepted_encoding(encoding, qvalue(params, 1000), acc)
-    end
-  end
-
   defp already_compressed?(path) do
     extension = path |> Path.extname() |> String.downcase()
     is_map_key(Config.already_compressed_extensions(), extension)
+  end
+
+  defp apply_if_range(:none, _, _), do: :none
+  defp apply_if_range(range, [], _), do: range
+  defp apply_if_range(range, [etag], etag), do: range
+  defp apply_if_range(_, _, _), do: :none
+
+  defp available_qvalue(data, encoding, qvalue) do
+    if :erlang.is_map_key(encoding, data), do: qvalue, else: 0
   end
 
   defp content(data, nil), do: data["raw"]
@@ -156,18 +166,12 @@ defmodule PhoenixAssetPipeline.Plug.Static do
 
   defp digested_stem?(_, _), do: false
 
-  defp encoding([], _, _), do: nil
+  defp encoding([], _), do: nil
 
-  defp encoding(accept, range, data) do
-    accepted = accepted_encodings(accept, {:unset, :unset, :unset, :unset, :unset, :unset})
-
-    if range == :none,
-      do: preferred_encoding(accepted, data),
-      else: preferred_identity(accepted, data)
-  end
-
-  defp fresh_etag?(headers, etag) do
-    Enum.any?(headers, &etag_header_match?(&1, etag, 0, byte_size(&1)))
+  defp encoding(accept, data) do
+    accept
+    |> accepted_encodings({:unset, :unset, :unset, :unset, :unset, :unset})
+    |> preferred_encoding(data)
   end
 
   defp etag_header_match?(_, _, index, size) when index >= size, do: false
@@ -213,23 +217,22 @@ defmodule PhoenixAssetPipeline.Plug.Static do
 
   defp etag_stop(_, _, _), do: nil
 
-  defp skip_etag_separators(header, index, size) when index < size do
-    if :binary.at(header, index) in [?,, ?\s, ?\t],
-      do: skip_etag_separators(header, index + 1, size),
-      else: index
+  defp finish_range(first, "", byte_size) when first < byte_size do
+    {:range, first, byte_size - 1}
   end
 
-  defp skip_etag_separators(_, index, _), do: index
+  defp finish_range(_, "", _), do: :unsatisfiable
 
-  defp weak_etag_start(header, index, size) when index + 1 < size do
-    if :binary.part(header, index, 2) == "W/", do: index + 2, else: index
+  defp finish_range(first, rest, byte_size) do
+    case Integer.parse(rest) do
+      {last, ""} when first < byte_size and last >= first -> {:range, first, min(last, byte_size - 1)}
+      {last, ""} when last >= 0 -> :unsatisfiable
+      _ -> :none
+    end
   end
 
-  defp weak_etag_start(_, index, _), do: index
-
-  defp wildcard_etag?(header, index, size) do
-    :binary.at(header, index) == ?* and
-      (index + 1 == size or :binary.at(header, index + 1) in [?,, ?\s, ?\t])
+  defp fresh_etag?(headers, etag) do
+    Enum.any?(headers, &etag_header_match?(&1, etag, 0, byte_size(&1)))
   end
 
   defp hex?(_, stop, stop), do: true
@@ -240,6 +243,10 @@ defmodule PhoenixAssetPipeline.Plug.Static do
     ((char >= ?0 and char <= ?9) or (char >= ?a and char <= ?f)) and
       hex?(path, index + 1, stop)
   end
+
+  defp identity_qvalue(:unset, 0), do: 0
+  defp identity_qvalue(:unset, _), do: 1000
+  defp identity_qvalue(qvalue, _), do: qvalue
 
   defp maybe_add_encoding(conn, nil), do: conn
   defp maybe_add_encoding(conn, encoding), do: put_resp_header(conn, "content-encoding", encoding)
@@ -262,16 +269,16 @@ defmodule PhoenixAssetPipeline.Plug.Static do
     put_resp_content_type(conn, content_type)
   end
 
-  defp not_found(conn) do
-    conn
-    |> send_resp(:not_found, "Not found")
-    |> halt()
-  end
-
   defp not_acceptable(conn) do
     conn
     |> maybe_add_vary()
     |> send_resp(:not_acceptable, "Not acceptable")
+    |> halt()
+  end
+
+  defp not_found(conn) do
+    conn
+    |> send_resp(:not_found, "Not found")
     |> halt()
   end
 
@@ -294,46 +301,36 @@ defmodule PhoenixAssetPipeline.Plug.Static do
   defp parse_qvalue("1.000"), do: 1000
   defp parse_qvalue(_), do: 0
 
-  defp path_raw([segment]), do: segment
-  defp path_raw(segments), do: Enum.join(segments, "/")
-
   defp path([segment]), do: decode_segment(segment)
 
   defp path(segments), do: Enum.map_join(segments, "/", &decode_segment/1)
 
-  defp qvalue(params, default) do
-    case :binary.match(params, ";") do
-      :nomatch ->
-        qvalue_param(params, default)
+  defp path_raw([segment]), do: segment
+  defp path_raw(segments), do: Enum.join(segments, "/")
 
-      {index, 1} ->
-        param = binary_part(params, 0, index)
-        rest = binary_part(params, index + 1, byte_size(params) - index - 1)
+  defp preferred_encoding({br, zstd, deflate, gzip, wildcard, identity}, data) do
+    br = available_qvalue(data, "br", qvalue_or_wildcard(br, wildcard))
+    zstd = available_qvalue(data, "zstd", qvalue_or_wildcard(zstd, wildcard))
+    deflate = available_qvalue(data, "deflate", qvalue_or_wildcard(deflate, wildcard))
+    gzip = available_qvalue(data, "gzip", qvalue_or_wildcard(gzip, wildcard))
+    identity = available_qvalue(data, "raw", identity_qvalue(identity, wildcard))
 
-        case qvalue_param(param, :missing) do
-          :missing -> qvalue(rest, default)
-          qvalue -> qvalue
-        end
+    case max(max(br, zstd), max(deflate, max(gzip, identity))) do
+      qvalue when qvalue <= 0 -> :not_acceptable
+      ^br -> "br"
+      ^zstd -> "zstd"
+      ^deflate -> "deflate"
+      ^gzip -> "gzip"
+      _ -> nil
     end
   end
 
-  defp qvalue_param(param, default) do
-    case :binary.match(param, "=") do
-      :nomatch ->
-        default
-
-      {index, 1} ->
-        name = param |> binary_part(0, index) |> trim_ascii()
-
-        if name in ["q", "Q"] do
-          param
-          |> binary_part(index + 1, byte_size(param) - index - 1)
-          |> trim_ascii()
-          |> parse_qvalue()
-        else
-          default
-        end
-    end
+  defp prepare_asset(%{private: %{phoenix_router_url: router_url}} = conn, encoding, asset, path, opts) do
+    conn
+    |> maybe_add_encoding(encoding)
+    |> maybe_put_content_type(opts.content_types, asset, path)
+    |> put_resp_header("accept-ranges", "bytes")
+    |> put_resp_header("access-control-allow-origin", router_url)
   end
 
   defp put_accepted_encoding("br", qvalue, {_, zstd, deflate, gzip, wildcard, identity}) do
@@ -372,40 +369,62 @@ defmodule PhoenixAssetPipeline.Plug.Static do
     put_resp_header(conn, "cache-control", value)
   end
 
-  defp preferred_encoding({br, zstd, deflate, gzip, wildcard, identity}, data) do
-    br = available_qvalue(data, "br", qvalue_or_wildcard(br, wildcard))
-    zstd = available_qvalue(data, "zstd", qvalue_or_wildcard(zstd, wildcard))
-    deflate = available_qvalue(data, "deflate", qvalue_or_wildcard(deflate, wildcard))
-    gzip = available_qvalue(data, "gzip", qvalue_or_wildcard(gzip, wildcard))
-    identity = available_qvalue(data, "raw", identity_qvalue(identity, wildcard))
+  defp qvalue(params, default) do
+    case :binary.match(params, ";") do
+      :nomatch ->
+        qvalue_param(params, default)
 
-    case max(max(br, zstd), max(deflate, max(gzip, identity))) do
-      qvalue when qvalue <= 0 -> :not_acceptable
-      ^br -> "br"
-      ^zstd -> "zstd"
-      ^deflate -> "deflate"
-      ^gzip -> "gzip"
-      _ -> nil
+      {index, 1} ->
+        param = binary_part(params, 0, index)
+        rest = binary_part(params, index + 1, byte_size(params) - index - 1)
+
+        case qvalue_param(param, :missing) do
+          :missing -> qvalue(rest, default)
+          qvalue -> qvalue
+        end
     end
   end
-
-  defp preferred_identity({_, _, _, _, wildcard, identity}, data) do
-    if available_qvalue(data, "raw", identity_qvalue(identity, wildcard)) > 0,
-      do: nil,
-      else: :not_acceptable
-  end
-
-  defp available_qvalue(data, encoding, qvalue) do
-    if :erlang.is_map_key(encoding, data), do: qvalue, else: 0
-  end
-
-  defp identity_qvalue(:unset, 0), do: 0
-  defp identity_qvalue(:unset, _), do: 1000
-  defp identity_qvalue(qvalue, _), do: qvalue
 
   defp qvalue_or_wildcard(:unset, :unset), do: 0
   defp qvalue_or_wildcard(:unset, wildcard), do: wildcard
   defp qvalue_or_wildcard(qvalue, _), do: qvalue
+
+  defp qvalue_param(param, default) do
+    case :binary.match(param, "=") do
+      :nomatch ->
+        default
+
+      {index, 1} ->
+        name = param |> binary_part(0, index) |> trim_ascii()
+
+        if name in ["q", "Q"] do
+          param
+          |> binary_part(index + 1, byte_size(param) - index - 1)
+          |> trim_ascii()
+          |> parse_qvalue()
+        else
+          default
+        end
+    end
+  end
+
+  defp request_range(%{method: "GET"} = conn, byte_size) do
+    request_range(get_req_header(conn, "range"), byte_size)
+  end
+
+  defp request_range([], _), do: :none
+
+  defp request_range(["bytes=" <> bytes], byte_size) when byte_size(bytes) <= 41 do
+    start_and_end(bytes, byte_size)
+  end
+
+  defp request_range(_, _), do: :none
+
+  defp send_asset(conn, content, byte_size, encoding, range, asset, path, opts) do
+    conn
+    |> prepare_asset(encoding, asset, path, opts)
+    |> serve_range(content, byte_size, range)
+  end
 
   defp send_range(conn, content, range_start, range_end, byte_size) do
     length = range_end - range_start + 1
@@ -419,6 +438,7 @@ defmodule PhoenixAssetPipeline.Plug.Static do
 
   defp send_unsatisfiable_range(conn, byte_size) do
     conn
+    |> delete_resp_header("content-encoding")
     |> maybe_add_vary()
     |> put_resp_header("content-range", "bytes */#{byte_size}")
     |> send_resp(416, "")
@@ -432,49 +452,23 @@ defmodule PhoenixAssetPipeline.Plug.Static do
     |> halt()
   end
 
+  defp serve_asset(conn, data, asset, path, opts) do
+    case encoding(get_req_header(conn, "accept-encoding"), data) do
+      :not_acceptable ->
+        not_acceptable(conn)
+
+      encoding ->
+        {content, byte_size} = content(data, encoding)
+        send_asset(conn, content, byte_size, encoding, request_range(conn, byte_size), asset, path, opts)
+    end
+  end
+
   defp serve_range(conn, content, byte_size, {:range, range_start, range_end}) do
     send_range(conn, content, range_start, range_end, byte_size)
   end
 
+  defp serve_range(conn, _, byte_size, :unsatisfiable), do: send_unsatisfiable_range(conn, byte_size)
   defp serve_range(conn, content, _, :none), do: serve(conn, content)
-
-  defp prepare_asset(%{private: %{phoenix_router_url: router_url}} = conn, encoding, asset, path, opts) do
-    conn
-    |> maybe_add_encoding(encoding)
-    |> maybe_put_content_type(opts.content_types, asset, path)
-    |> put_resp_header("accept-ranges", "bytes")
-    |> put_resp_header("access-control-allow-origin", router_url)
-  end
-
-  defp send_asset(conn, content, byte_size, encoding, range, asset, path, opts) do
-    conn
-    |> prepare_asset(encoding, asset, path, opts)
-    |> serve_range(content, byte_size, range)
-  end
-
-  defp serve_asset(conn, data, asset, path, opts) do
-    {_, raw_byte_size} = data["raw"]
-    range = request_range(get_req_header(conn, "range"), raw_byte_size)
-
-    encoding =
-      conn
-      |> get_req_header("accept-encoding")
-      |> encoding(range, data)
-
-    case {range, encoding} do
-      {:unsatisfiable, _} ->
-        conn
-        |> prepare_asset(nil, asset, path, opts)
-        |> send_unsatisfiable_range(raw_byte_size)
-
-      {_, :not_acceptable} ->
-        not_acceptable(conn)
-
-      _ ->
-        {content, byte_size} = content(data, encoding)
-        send_asset(conn, content, byte_size, encoding, range, asset, path, opts)
-    end
-  end
 
   defp serve_static_asset(conn, segments, type, opts) do
     path = path_raw(segments)
@@ -503,31 +497,11 @@ defmodule PhoenixAssetPipeline.Plug.Static do
   end
 
   defp serve_static_file(conn, %{data: data} = asset, path, opts) do
-    {_, raw_byte_size, raw_etag} = data["raw"]
-
-    range =
-      conn
-      |> get_req_header("range")
-      |> request_range(raw_byte_size)
-      |> apply_if_range(get_req_header(conn, "if-range"), raw_etag)
-
-    encoding =
-      conn
-      |> get_req_header("accept-encoding")
-      |> encoding(range, data)
-
-    case {range, encoding} do
-      {:unsatisfiable, _} ->
-        conn
-        |> put_cache_control("public", path)
-        |> put_resp_header("etag", raw_etag)
-        |> prepare_asset(nil, asset, path, opts)
-        |> send_unsatisfiable_range(raw_byte_size)
-
-      {_, :not_acceptable} ->
+    case encoding(get_req_header(conn, "accept-encoding"), data) do
+      :not_acceptable ->
         not_acceptable(conn)
 
-      _ ->
+      encoding ->
         {content, byte_size, etag} = content(data, encoding)
 
         conn =
@@ -541,23 +515,23 @@ defmodule PhoenixAssetPipeline.Plug.Static do
           |> send_resp(:not_modified, "")
           |> halt()
         else
+          range =
+            conn
+            |> request_range(byte_size)
+            |> apply_if_range(get_req_header(conn, "if-range"), etag)
+
           send_asset(conn, content, byte_size, encoding, range, asset, path, opts)
         end
     end
   end
 
-  defp apply_if_range(:none, _, _), do: :none
-  defp apply_if_range(range, [], _), do: range
-  defp apply_if_range(range, [etag], etag), do: range
-  defp apply_if_range(_, _, _), do: :none
-
-  defp request_range([], _), do: :none
-
-  defp request_range(["bytes=" <> bytes], byte_size) when byte_size(bytes) <= 41 do
-    start_and_end(bytes, byte_size)
+  defp skip_etag_separators(header, index, size) when index < size do
+    if :binary.at(header, index) in [?,, ?\s, ?\t],
+      do: skip_etag_separators(header, index + 1, size),
+      else: index
   end
 
-  defp request_range(_, _), do: :none
+  defp skip_etag_separators(_, index, _), do: index
 
   defp start_and_end("-" <> rest, byte_size) do
     case Integer.parse(rest) do
@@ -570,20 +544,6 @@ defmodule PhoenixAssetPipeline.Plug.Static do
   defp start_and_end(range, byte_size) do
     case Integer.parse(range) do
       {first, "-" <> rest} when first >= 0 -> finish_range(first, rest, byte_size)
-      _ -> :none
-    end
-  end
-
-  defp finish_range(first, "", byte_size) when first < byte_size do
-    {:range, first, byte_size - 1}
-  end
-
-  defp finish_range(_, "", _), do: :unsatisfiable
-
-  defp finish_range(first, rest, byte_size) do
-    case Integer.parse(rest) do
-      {last, ""} when first < byte_size and last >= first -> {:range, first, min(last, byte_size - 1)}
-      {last, ""} when last >= 0 -> :unsatisfiable
       _ -> :none
     end
   end
@@ -632,4 +592,15 @@ defmodule PhoenixAssetPipeline.Plug.Static do
   end
 
   defp trim_ascii_right(_, 0), do: ""
+
+  defp weak_etag_start(header, index, size) when index + 1 < size do
+    if :binary.part(header, index, 2) == "W/", do: index + 2, else: index
+  end
+
+  defp weak_etag_start(_, index, _), do: index
+
+  defp wildcard_etag?(header, index, size) do
+    :binary.at(header, index) == ?* and
+      (index + 1 == size or :binary.at(header, index + 1) in [?,, ?\s, ?\t])
+  end
 end

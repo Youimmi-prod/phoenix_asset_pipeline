@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.0
+
+- Remove image placeholders from `<.picture>`
+- Strip metadata from generated images
+- Update Brotli to 9.0 and Bun to 1.4.2
+- Replace `:manifest_mode` with `:precompiled_manifest` (default `false`); enable it for production
+- Fix development reloads, HTTP ranges and conditional requests, HEEx `noformat`, and class formatting
+- Reduce Bun hashing, module-class scans, numeric-entity parsing costs, and temporary allocations
+
 ## 3.0.2
 
 - Render image placeholders at 80% opacity

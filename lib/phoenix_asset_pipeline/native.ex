@@ -10,13 +10,13 @@ defmodule PhoenixAssetPipeline.Native do
     |> unwrap_css_result()
   end
 
+  def finalize_css_nif(_, _, _, _), do: :erlang.nif_error(:nif_not_loaded)
+
   def prepare_css(css) when is_binary(css) do
     css
     |> prepare_css_nif()
     |> unwrap_css_result()
   end
-
-  def finalize_css_nif(_, _, _, _), do: :erlang.nif_error(:nif_not_loaded)
 
   def prepare_css_nif(_), do: :erlang.nif_error(:nif_not_loaded)
 

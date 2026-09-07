@@ -13,14 +13,14 @@ defmodule PhoenixAssetPipeline.Cache do
     _ -> default
   end
 
-  def write_term!(path, term) do
-    write_atomic!(path, :erlang.term_to_iovec(term))
-  end
-
   @doc false
   def write_atomic!(path, content) when is_binary(content) or is_list(content) do
     File.mkdir_p!(Path.dirname(path))
     publish_atomic!(path, content)
+  end
+
+  def write_term!(path, term) do
+    write_atomic!(path, :erlang.term_to_iovec(term))
   end
 
   defp publish_atomic!(path, content) do

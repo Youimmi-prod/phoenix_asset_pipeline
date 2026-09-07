@@ -10,6 +10,13 @@ struct BinaryWriter {
 }
 
 impl BinaryWriter {
+    fn into_binary<'a>(mut self, env: Env<'a>) -> NifResult<Binary<'a>> {
+        self.resize(self.len)
+            .map_err(|_| Error::Term(Box::new("brotli alloc error")))?;
+
+        Ok(Binary::from_owned(self.binary, env))
+    }
+
     fn new(capacity: usize, limit: usize) -> NifResult<Self> {
         let binary = OwnedBinary::new(capacity)
             .ok_or_else(|| Error::Term(Box::new("brotli alloc error")))?;
@@ -20,13 +27,6 @@ impl BinaryWriter {
             limit,
             overflowed: false,
         })
-    }
-
-    fn into_binary<'a>(mut self, env: Env<'a>) -> NifResult<Binary<'a>> {
-        self.resize(self.len)
-            .map_err(|_| Error::Term(Box::new("brotli alloc error")))?;
-
-        Ok(Binary::from_owned(self.binary, env))
     }
 
     fn reserve(&mut self, additional: usize) -> io::Result<()> {
@@ -72,6 +72,9 @@ impl BinaryWriter {
 }
 
 impl Write for BinaryWriter {
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_all(buf)?;
         Ok(buf.len())
@@ -84,10 +87,6 @@ impl Write for BinaryWriter {
         self.binary.as_mut_slice()[self.len..next].copy_from_slice(buf);
         self.len = next;
 
-        Ok(())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }

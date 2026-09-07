@@ -9,15 +9,15 @@ defmodule PhoenixAssetPipeline.Config do
   @assets_dir Application.compile_env(:phoenix_asset_pipeline, :assets_dir, "assets")
   @image_densities Application.compile_env(:phoenix_asset_pipeline, :image_densities, [1, 2])
   @image_max_pixels Application.compile_env(:phoenix_asset_pipeline, :image_max_pixels, 40_000_000)
-  @manifest_mode Application.compile_env(:phoenix_asset_pipeline, :manifest_mode, :cached)
   @otp_app Application.compile_env!(:phoenix_asset_pipeline, :otp_app)
+  @precompiled_manifest Application.compile_env(:phoenix_asset_pipeline, :precompiled_manifest, false)
   @static_dir Application.compile_env(:phoenix_asset_pipeline, :static_dir, "priv/static")
   @svg_sprites Application.compile_env(:phoenix_asset_pipeline, :svg_sprites, [])
   @endpoint_key {__MODULE__, :endpoint}
   @endpoint_missing :__phoenix_asset_pipeline_endpoint_missing__
 
-  if @manifest_mode not in [:cached, :precompiled] do
-    raise ArgumentError, ":manifest_mode for :phoenix_asset_pipeline must be :cached or :precompiled"
+  if not is_boolean(@precompiled_manifest) do
+    raise ArgumentError, ":precompiled_manifest for :phoenix_asset_pipeline must be a boolean"
   end
 
   if not (is_list(@image_densities) and @image_densities != [] and
@@ -33,10 +33,6 @@ defmodule PhoenixAssetPipeline.Config do
 
   def already_compressed_extensions, do: @already_compressed_extensions
 
-  def assets_dir, do: Path.expand(@assets_dir)
-  def image_densities, do: @image_densities
-  def image_max_pixels, do: @image_max_pixels
-
   def application_ebin_dir do
     case :code.lib_dir(otp_app()) do
       path when is_list(path) -> path |> List.to_string() |> Path.join("ebin")
@@ -44,6 +40,7 @@ defmodule PhoenixAssetPipeline.Config do
     end
   end
 
+  def assets_dir, do: Path.expand(@assets_dir)
   def build_path, do: Path.expand(mix_project_build_path() || Path.join(["_build", to_string(mix_env())]))
 
   def colocated_dir do
@@ -67,6 +64,9 @@ defmodule PhoenixAssetPipeline.Config do
       raise "missing :endpoint config for :phoenix_asset_pipeline"
   end
 
+  def image_densities, do: @image_densities
+  def image_max_pixels, do: @image_max_pixels
+
   def js_drop do
     :phoenix_asset_pipeline
     |> Application.get_env(:js_drop, [])
@@ -85,8 +85,6 @@ defmodule PhoenixAssetPipeline.Config do
     Application.get_env(:phoenix_asset_pipeline, :live_reload_topic, "phoenix:live_reload")
   end
 
-  def manifest_mode, do: @manifest_mode
-
   def manifest_cache_dir do
     build_path()
     |> Path.join("phoenix_asset_pipeline")
@@ -94,6 +92,7 @@ defmodule PhoenixAssetPipeline.Config do
   end
 
   def otp_app, do: @otp_app
+  def precompiled_manifest?, do: @precompiled_manifest
   def project_dir, do: Path.dirname(assets_dir())
   def static_dir, do: Path.expand(@static_dir)
   def svg_sprites, do: @svg_sprites

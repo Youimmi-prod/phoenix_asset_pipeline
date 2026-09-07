@@ -1,28 +1,22 @@
 # PhoenixAssetPipeline
 
-Asset pipeline for Phoenix and Phoenix LiveView. It builds and caches application assets, minifies CSS/HTML classes, generates image and SVG variants, compresses static files, and serves everything from one manifest.
+Build, optimize, cache, and serve Phoenix assets from one manifest.
 
 [![Hex.pm](https://img.shields.io/hexpm/v/phoenix_asset_pipeline.svg)](https://hex.pm/packages/phoenix_asset_pipeline) [![Documentation](https://img.shields.io/badge/documentation-gray)](https://hexdocs.pm/phoenix_asset_pipeline)
 
 ## Requirements
 
-- Elixir 1.18+
-- Erlang/OTP 28+
-- Phoenix LiveView
-- Rust 1.98+ (edition 2024)
-- Bun packages declared in the application's `assets/package.json`
+Elixir 1.18+, Erlang/OTP 28+, Rust 1.98+, and Phoenix LiveView. The pipeline installs and manages its pinned Bun version.
 
 ## Installation
 
+Add the dependency and compilers to `mix.exs`:
+
 ```elixir
 def deps do
-  [{:phoenix_asset_pipeline, "~> 3.0"}]
+  [{:phoenix_asset_pipeline, "~> 4.0"}]
 end
-```
 
-Prepare module-scope classes before Elixir and build the manifest after the application compiler:
-
-```elixir
 def project do
   [
     compilers:
@@ -33,49 +27,40 @@ def project do
 end
 ```
 
-Configure the endpoint and HEEx engine:
+Configure the application:
 
 ```elixir
-manifest_mode =
-  case config_env() do
-    :dev -> :cached
-    :test -> :cached
-    :prod -> :precompiled
-  end
-
 config :phoenix, template_engines: [heex: PhoenixAssetPipeline.HTML.Engine]
+
 config :phoenix_asset_pipeline,
-  bun_version: "1.4.0",
   endpoint: MyAppWeb.Endpoint,
-  manifest_mode: manifest_mode,
   otp_app: :my_app
 ```
 
-Start the pipeline before the endpoint:
+Enable a precompiled manifest in `config/prod.exs`:
 
 ```elixir
-children = [
-  PhoenixAssetPipeline,
-  MyAppWeb.Endpoint
-]
+config :phoenix_asset_pipeline, precompiled_manifest: true
+```
+
+The default is a cached manifest. Use your application's name for `otp_app`. Start `PhoenixAssetPipeline` before the endpoint:
+
+```elixir
+children = [PhoenixAssetPipeline, MyAppWeb.Endpoint]
 ```
 
 ## HTML
 
-Use the macros in the application's HTML surface:
+Add these imports to the application's HTML helpers:
 
 ```elixir
-def html do
-  quote do
-    use PhoenixAssetPipeline.HTML.Macros
+use PhoenixAssetPipeline.HTML.Macros
 
-    import PhoenixAssetPipeline.Components
-    import PhoenixAssetPipeline.Helpers
-  end
-end
+import PhoenixAssetPipeline.Components
+import PhoenixAssetPipeline.Helpers
 ```
 
-Render manifest-backed assets:
+Render assets:
 
 ```heex
 <html data-d={asset_digest()}>
@@ -85,12 +70,6 @@ Render manifest-backed assets:
   </head>
   <body>{@inner_content}</body>
 </html>
-```
-
-Include the packaged component utilities in the Tailwind source set from `assets/css/app.css`:
-
-```css
-@source "../../deps/phoenix_asset_pipeline/lib/phoenix_asset_pipeline/components.ex";
 ```
 
 Serve static files before the router:
@@ -104,96 +83,51 @@ plug MyAppWeb.Router
 
 ## Classes
 
-Calls from functions and HEEx templates resolve through the current manifest at runtime. Module attributes and component defaults embed stable minified literals prepared before Elixir compilation; production builds allocate them deterministically.
+Classes are minified consistently in CSS, HEEx, and Elixir. Use `class/1` in Elixir expressions:
 
 ```elixir
 @container {:div, class: class("h-full")}
 
-def button(assigns) do
-  ~H"""
-  <button class={class(["button", {"enabled", @enabled}])}>...</button>
-  """
-end
+class(["button", {"enabled", enabled}])
 ```
 
-Component attributes ending in `_class` are extracted, obfuscated, and formatted like `class`, so literal values do
-not need an explicit `class(...)` call:
+Literal `class` and `*_class` component attributes are handled automatically.
 
-```elixir
-attr :img_class, :any, default: nil
-attr :src, :string, required: true
+Include the library's component utilities in `assets/css/app.css`:
 
-def avatar(assigns) do
-  ~H"""<img alt="" class={@img_class} src={@src} />"""
-end
+```css
+@source "../../deps/phoenix_asset_pipeline/lib/phoenix_asset_pipeline/components.ex";
 ```
 
-```heex
-<.avatar img_class="h-36 object-contain w-auto" src="/avatar.png" />
-```
-
-The prepare and final compilers share the same mapping, so module values, runtime values, manifest entries, and CSS selectors remain consistent without a second Elixir compilation.
+The prepare compiler resolves module attributes and component defaults before Elixir compilation. Function and HEEx expressions use the current manifest at runtime.
 
 ## Assets
 
 Default inputs:
 
-- `assets/js/*.{js,ts,jsx,tsx,mjs,cjs}`
+- `assets/js/*.{js,ts,jsx,tsx,mjs,cjs}` and LiveView colocated assets
 - `assets/css/*.css`
 - `assets/img/**/*.{jpg,jpeg,png,webp,avif}`
-- `assets/svg/**/*.svg`
-- `assets/svg/sprites/<name>/*.svg`
-- Phoenix LiveView colocated assets
+- `assets/svg/**/*.svg` and `assets/svg/sprites/<name>/*.svg`
 - `priv/static/**`
 
-Bun installs application-side dependencies when the package or lockfile changes. Production builds require
-`assets/bun.lock` and install with `--frozen-lockfile`. Image masters are auto-oriented and converted into AVIF,
-WebP, and PNG density variants with `vix`/libvips. Bun supplies the low-resolution geometry for each light-gray
-placeholder.
-Brotli, gzip, deflate, and Zstandard representations are stored only when they are smaller than the original.
+Declare Bun packages in `assets/package.json`. Dependencies are installed when the package or lockfile changes; production requires `assets/bun.lock` and uses `--frozen-lockfile`.
 
-The source image is the master for the highest configured density. With the default `image_densities: [1, 2]`, a
-40×20 source produces a 20×10 base image and a 40×20 `-2x` image in every output format. The `picture` component
-layers a content-addressed placeholder PNG beneath the responsive image, so pages request only the placeholders
-they render. Transparent masters receive a conservative inset mask that preserves internal transparency and stays
-inside their outer transparent edges.
+Images are auto-oriented and converted to AVIF, WebP, and PNG with libvips. The source is the highest density: with `image_densities: [1, 2]`, a 40×20 source produces 20×10 and 40×20 variants. `<.picture>` renders responsive sources and a PNG fallback; `width` and `height` reserve space during loading.
 
-Common options:
-
-```elixir
-config :phoenix_asset_pipeline,
-  already_compressed_extensions: ~w(.avif .png .webp),
-  assets_dir: "assets",
-  image_densities: [1, 2],
-  image_max_pixels: 40_000_000,
-  static_dir: "priv/static"
+```heex
+<.picture id="hero" src="hero" alt="Welcome" width="640" height="480" />
 ```
 
-`already_compressed_extensions`, `assets_dir`, `bun_version`, `image_densities`, `image_max_pixels`,
-`manifest_mode`, `otp_app`, and `static_dir` are compile-time settings. `bun_version` must be an exact semantic
-version and `otp_app` must match the application name from `mix.exs`. `manifest_mode` defaults to `:cached`;
-production builds must set it to `:precompiled`.
+Images default to densities `[1, 2]` and a 40,000,000-pixel input limit. Override `image_densities` or `image_max_pixels` when needed.
 
-Hidden files and directories under `static_dir` are excluded, except for non-hidden files under the root `.well-known`
-directory. This directory is included automatically for standard files such as Digital Asset Links and Apple App Site
-Association. Add `.well-known` to `:only` when filtering requests in `PhoenixAssetPipeline.Plug.Static`.
+Brotli, gzip, deflate, and Zstandard variants are kept only when smaller than the original. Already compressed files use `Cache-Control: no-transform`.
 
-Files matching `already_compressed_extensions` are served with `Cache-Control: no-transform` so the HTTP server
-does not compress them again dynamically.
-
-The compile-time `trusted_types` setting replaces the CSP policy allowlist, which defaults to
-`~w(decodeHTMLEntitiesPolicy default)`. For DOMPurify, configure:
-
-```elixir
-config :phoenix_asset_pipeline, trusted_types: ~w(decodeHTMLEntitiesPolicy default dompurify)
-```
-
-Use `secure_browser_headers/1` without editing the returned CSP string to preserve header caching.
+Hidden static files are excluded except for files under the root `.well-known` directory. Add `.well-known` to the static plug's `:only` list when serving it.
 
 ### SVG sprites
 
-Use `svg_sprites` to select SVG files outside `assets/svg/sprites`. Paths are relative to the project root, and
-`names` selects files by basename without requiring literal references in application code:
+Select external SVGs by basename with `svg_sprites`; paths are relative to the project root:
 
 ```elixir
 config :phoenix_asset_pipeline,
@@ -207,26 +141,43 @@ config :phoenix_asset_pipeline,
   ]
 ```
 
-Internal SVG IDs are namespaced by default so references from different source files cannot collide. Set
-`namespace_ids: false` only when every selected SVG is known to contain no internal IDs. When `metadata_file` is
-set, its XML-escaped text is inserted as one root `<metadata>` element after optimization. Changes to the metadata
-file invalidate the SVG cache and trigger development rebuilds.
+Internal SVG IDs are namespaced to prevent collisions. Use `namespace_ids: false` only for sources without internal IDs. Optional `metadata_file` text is escaped and inserted as root metadata; changes invalidate the cache.
+
+### Browser headers
+
+Use `secure_browser_headers/1` to generate cached headers. To allow DOMPurify, replace the Trusted Types policy list at compile time:
+
+```elixir
+config :phoenix_asset_pipeline, trusted_types: ~w(decodeHTMLEntitiesPolicy default dompurify)
+```
 
 ## Build
 
+Rebuild the manifest before rendering reloaded code in `config/dev.exs`:
+
+```elixir
+config :my_app, MyAppWeb.Endpoint,
+  reloadable_compilers: [
+    :phoenix_live_view,
+    :elixir,
+    :app,
+    :phoenix_asset_pipeline
+  ]
+```
+
 ```sh
-# Development
+# Watch and rebuild in development
 mix phx.server
 
-# Production
+# Build the production manifest
 MIX_ENV=prod mix release
 
-# Manual manifest rebuild
+# Rebuild the manifest manually
 mix phoenix_asset_pipeline.manifest
 ```
 
-The development watcher rebuilds changed assets and broadcasts LiveReload events. Production compilation generates `PhoenixAssetPipeline.Manifest.Precompiled`; separate asset build/deploy tasks are not required.
+Production uses `PhoenixAssetPipeline.Manifest.Precompiled`; no separate asset build or deploy task is needed.
 
 ## License
 
-PhoenixAssetPipeline is released under the MIT License. See [LICENSE](./LICENSE).
+[MIT](./LICENSE).

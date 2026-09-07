@@ -14,43 +14,16 @@ defmodule PhoenixAssetPipeline.Watcher do
 
   @debounce_ms 120
 
+  def child_spec(_) do
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, []},
+      restart: :transient
+    }
+  end
+
   @impl true
-  def init(_) do
-    Process.flag(:trap_exit, true)
-    dirs = Assets.watch_dirs()
-
-    case dirs do
-      [] ->
-        Logger.warning("Could not watch PhoenixAssetPipeline sources: no source directories exist")
-
-        :ignore
-
-      [_ | _] ->
-        start_file_system(dirs)
-    end
-  end
-
-  defp start_file_system(dirs) do
-    case FileSystem.start_link(dirs: dirs) do
-      {:ok, monitor} ->
-        :ok = FileSystem.subscribe(monitor)
-
-        state = %{
-          dirs: dirs,
-          monitor: monitor,
-          pending?: false,
-          rebuild: nil,
-          timer: nil
-        }
-
-        {:ok, schedule_rebuild(state)}
-
-      {:error, reason} ->
-        Logger.warning("Could not watch PhoenixAssetPipeline sources: #{inspect(reason)}")
-
-        :ignore
-    end
-  end
+  def handle_cast(:rebuild, state), do: {:noreply, schedule_rebuild(state)}
 
   @impl true
   def handle_info({:file_event, monitor, {path, _}}, %{monitor: monitor} = state) do
@@ -90,17 +63,20 @@ defmodule PhoenixAssetPipeline.Watcher do
 
   def handle_info(_, state), do: {:noreply, state}
 
-  def child_spec(_) do
-    %{
-      id: __MODULE__,
-      start: {__MODULE__, :start_link, []},
-      restart: :transient
-    }
-  end
+  @impl true
+  def init(_) do
+    Process.flag(:trap_exit, true)
+    dirs = Assets.watch_dirs()
 
-  @doc false
-  def start_link do
-    GenServer.start_link(__MODULE__, [], name: __MODULE__)
+    case dirs do
+      [] ->
+        Logger.warning("Could not watch PhoenixAssetPipeline sources: no source directories exist")
+
+        :ignore
+
+      [_ | _] ->
+        start_file_system(dirs)
+    end
   end
 
   @doc false
@@ -108,8 +84,10 @@ defmodule PhoenixAssetPipeline.Watcher do
     GenServer.cast(__MODULE__, :rebuild)
   end
 
-  @impl true
-  def handle_cast(:rebuild, state), do: {:noreply, schedule_rebuild(state)}
+  @doc false
+  def start_link do
+    GenServer.start_link(__MODULE__, [], name: __MODULE__)
+  end
 
   @impl true
   def terminate(_, %{rebuild: {pid, _}}) do
@@ -131,6 +109,18 @@ defmodule PhoenixAssetPipeline.Watcher do
     end
   end
 
+  defp finish_rebuild(%{pending?: true} = state) do
+    schedule_rebuild(%{state | pending?: false, rebuild: nil})
+  end
+
+  defp finish_rebuild(state), do: %{state | rebuild: nil}
+
+  defp ignored_source_path?(path) do
+    path
+    |> Path.split()
+    |> Enum.any?(&(&1 == "node_modules"))
+  end
+
   defp run_rebuild do
     previous_signature = AssetPipeline.Manifest.get(:signature)
 
@@ -147,29 +137,6 @@ defmodule PhoenixAssetPipeline.Watcher do
         Exception.message(exception)
       ])
   end
-
-  defp finish_rebuild(%{pending?: true} = state) do
-    schedule_rebuild(%{state | pending?: false, rebuild: nil})
-  end
-
-  defp finish_rebuild(state), do: %{state | rebuild: nil}
-
-  defp start_rebuild(%{rebuild: nil} = state) do
-    parent = self()
-
-    {pid, ref} =
-      :erlang.spawn_opt(
-        fn ->
-          run_rebuild()
-          send(parent, {:asset_pipeline_rebuild_done, self()})
-        end,
-        [:link, :monitor]
-      )
-
-    %{state | rebuild: {pid, ref}, pending?: false}
-  end
-
-  defp start_rebuild(state), do: %{state | pending?: true}
 
   defp schedule_rebuild(%{timer: timer} = state) when is_reference(timer) do
     Process.cancel_timer(timer)
@@ -199,9 +166,42 @@ defmodule PhoenixAssetPipeline.Watcher do
     !ignored_source_path?(path) and Enum.any?(dirs, &(path == &1 or String.starts_with?(path, &1 <> "/")))
   end
 
-  defp ignored_source_path?(path) do
-    path
-    |> Path.split()
-    |> Enum.any?(&(&1 == "node_modules"))
+  defp start_file_system(dirs) do
+    case FileSystem.start_link(dirs: dirs) do
+      {:ok, monitor} ->
+        :ok = FileSystem.subscribe(monitor)
+
+        state = %{
+          dirs: dirs,
+          monitor: monitor,
+          pending?: false,
+          rebuild: nil,
+          timer: nil
+        }
+
+        {:ok, schedule_rebuild(state)}
+
+      {:error, reason} ->
+        Logger.warning("Could not watch PhoenixAssetPipeline sources: #{inspect(reason)}")
+
+        :ignore
+    end
   end
+
+  defp start_rebuild(%{rebuild: nil} = state) do
+    parent = self()
+
+    {pid, ref} =
+      :erlang.spawn_opt(
+        fn ->
+          run_rebuild()
+          send(parent, {:asset_pipeline_rebuild_done, self()})
+        end,
+        [:link, :monitor]
+      )
+
+    %{state | rebuild: {pid, ref}, pending?: false}
+  end
+
+  defp start_rebuild(state), do: %{state | pending?: true}
 end

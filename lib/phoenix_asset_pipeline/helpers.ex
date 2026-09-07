@@ -51,10 +51,10 @@ defmodule PhoenixAssetPipeline.Helpers do
   end
 
   @doc false
-  def image_placeholder(path) do
-    {source_path, _} = asset_path(path)
-    %{placeholder_path: placeholder_path} = find!(:image_sources, source_path)
-    src(placeholder_path)
+  def escape_attrs(attrs) when is_list(attrs) do
+    attrs
+    |> attributes_escape()
+    |> elem(1)
   end
 
   @doc """
@@ -132,13 +132,6 @@ defmodule PhoenixAssetPipeline.Helpers do
     {:safe, [?<, "script", attrs, ?>, ?<, ?/, "script", ?>]}
   end
 
-  @doc false
-  def escape_attrs(attrs) when is_list(attrs) do
-    attrs
-    |> attributes_escape()
-    |> elem(1)
-  end
-
   @doc """
   Returns a safe `<source>` tag with manifest-backed `srcset` entries.
   """
@@ -172,22 +165,17 @@ defmodule PhoenixAssetPipeline.Helpers do
     path <> fragment
   end
 
-  defp build_module_class_descriptors({_, _, module_descriptors}, descriptors, classes) do
-    put_module_class_descriptors(module_descriptors, descriptors, classes)
+  defp asset_path(path) do
+    case :binary.match(path, ["://", "?", "#"]) do
+      :nomatch -> {path, ""}
+      _ -> uri_path(URI.parse(path))
+    end
   end
 
-  defp build_module_class_descriptors({_, _, module_descriptors, _}, descriptors, classes) do
-    put_module_class_descriptors(module_descriptors, descriptors, classes)
-  end
-
-  defp put_module_class_descriptors(module_descriptors, descriptors, classes) do
-    Enum.reduce(module_descriptors, descriptors, fn {{kind, _} = key, descriptor}, descriptors
-                                                    when kind in [:string, :attr] ->
-      case descriptors do
-        %{^key => _} -> descriptors
-        _ -> Map.put(descriptors, key, build_class_descriptor(kind, descriptor, classes))
-      end
-    end)
+  defp asset_url(endpoint, static_url, path) do
+    if local_static_url?(static_url),
+      do: endpoint.static_path(path),
+      else: static_url <> endpoint.static_path(path)
   end
 
   defp build_class_values(_, mask, limit, _, _, values) when mask == limit do
@@ -207,11 +195,37 @@ defmodule PhoenixAssetPipeline.Helpers do
     )
   end
 
+  defp build_module_class_descriptors({_, _, module_descriptors}, descriptors, classes) do
+    put_module_class_descriptors(module_descriptors, descriptors, classes)
+  end
+
+  defp build_module_class_descriptors({_, _, module_descriptors, _}, descriptors, classes) do
+    put_module_class_descriptors(module_descriptors, descriptors, classes)
+  end
+
+  defp cache_asset_urls(key, digest, endpoint) do
+    static_url = endpoint.static_url()
+
+    urls =
+      :image_sources
+      |> Manifest.get(%{})
+      |> put_asset_urls(%{}, endpoint, static_url)
+
+    urls =
+      :script_tags
+      |> Manifest.get(%{})
+      |> put_asset_urls(urls, endpoint, static_url)
+
+    :persistent_term.put(key, {digest, urls})
+    urls
+  end
+
   defp class_attr([], _), do: []
   defp class_attr(class_list, attr_key), do: [{attr_key, class_list}]
 
-  defp class_value(:string, class_list), do: Enum.join(class_list, " ")
-  defp class_value(:attr, class_list), do: class_list
+  defp class_condition_matches?(0, _), do: true
+  defp class_condition_matches?(condition, mask) when condition > 0, do: Bitwise.band(mask, condition) != 0
+  defp class_condition_matches?(condition, mask), do: Bitwise.band(mask, -condition) == 0
 
   defp class_list_for_mask(static_classes, dynamic_class_groups, mask) do
     case dynamic_classes_for_mask(dynamic_class_groups, mask, 1, []) do
@@ -220,22 +234,8 @@ defmodule PhoenixAssetPipeline.Helpers do
     end
   end
 
-  defp dynamic_classes_for_mask([class_group | rest], mask, bit, acc) do
-    acc =
-      case class_group do
-        {:choice, truthy_class_group, falsy_class_group} ->
-          if Bitwise.band(mask, bit) == 0,
-            do: prepend_all(falsy_class_group, acc),
-            else: prepend_all(truthy_class_group, acc)
-
-        class_group ->
-          if Bitwise.band(mask, bit) == 0, do: acc, else: prepend_all(class_group, acc)
-      end
-
-    dynamic_classes_for_mask(rest, mask, Bitwise.bsl(bit, 1), acc)
-  end
-
-  defp dynamic_classes_for_mask([], _, _, acc), do: acc
+  defp class_value(:string, class_list), do: Enum.join(class_list, " ")
+  defp class_value(:attr, class_list), do: class_list
 
   defp compact_class_entries(static_classes, dynamic_class_groups) do
     entries = Enum.reduce(static_classes, [], &[{&1, 0} | &2])
@@ -273,9 +273,22 @@ defmodule PhoenixAssetPipeline.Helpers do
 
   defp compact_class_list([], _, classes), do: :lists.reverse(classes)
 
-  defp class_condition_matches?(0, _), do: true
-  defp class_condition_matches?(condition, mask) when condition > 0, do: Bitwise.band(mask, condition) != 0
-  defp class_condition_matches?(condition, mask), do: Bitwise.band(mask, -condition) == 0
+  defp dynamic_classes_for_mask([class_group | rest], mask, bit, acc) do
+    acc =
+      case class_group do
+        {:choice, truthy_class_group, falsy_class_group} ->
+          if Bitwise.band(mask, bit) == 0,
+            do: prepend_all(falsy_class_group, acc),
+            else: prepend_all(truthy_class_group, acc)
+
+        class_group ->
+          if Bitwise.band(mask, bit) == 0, do: acc, else: prepend_all(class_group, acc)
+      end
+
+    dynamic_classes_for_mask(rest, mask, Bitwise.bsl(bit, 1), acc)
+  end
+
+  defp dynamic_classes_for_mask([], _, _, acc), do: acc
 
   defp file_path(path, ""), do: path
 
@@ -290,6 +303,15 @@ defmodule PhoenixAssetPipeline.Helpers do
       raise ArgumentError, "missing asset #{inspect(key)} in manifest section #{inspect(section)}"
   end
 
+  defp local_static_url?("http://localhost" <> rest), do: local_static_url_suffix?(rest)
+  defp local_static_url?("https://localhost" <> rest), do: local_static_url_suffix?(rest)
+  defp local_static_url?(_), do: false
+
+  defp local_static_url_suffix?(""), do: true
+  defp local_static_url_suffix?("/" <> _), do: true
+  defp local_static_url_suffix?(":" <> _), do: true
+  defp local_static_url_suffix?(_), do: false
+
   defp prepend_all([item | rest], acc), do: prepend_all(rest, [item | acc])
   defp prepend_all([], acc), do: acc
 
@@ -298,6 +320,22 @@ defmodule PhoenixAssetPipeline.Helpers do
   end
 
   defp prepend_class_conditions(entries, [], _), do: entries
+
+  defp put_asset_urls(entries, urls, endpoint, static_url) do
+    Enum.reduce(entries, urls, fn {_, %{path: path}}, urls ->
+      Map.put(urls, path, asset_url(endpoint, static_url, path))
+    end)
+  end
+
+  defp put_module_class_descriptors(module_descriptors, descriptors, classes) do
+    Enum.reduce(module_descriptors, descriptors, fn {{kind, _} = key, descriptor}, descriptors
+                                                    when kind in [:string, :attr] ->
+      case descriptors do
+        %{^key => _} -> descriptors
+        _ -> Map.put(descriptors, key, build_class_descriptor(kind, descriptor, classes))
+      end
+    end)
+  end
 
   defp resolve_class_names(class_names, classes) do
     resolve_class_names(class_names, classes, [])
@@ -308,6 +346,14 @@ defmodule PhoenixAssetPipeline.Helpers do
   end
 
   defp resolve_class_names([], _, acc), do: acc
+
+  defp resolve_dynamic_class_group({:choice, truthy_class_group, falsy_class_group}, classes) do
+    {:choice, resolve_class_names(truthy_class_group, classes), resolve_class_names(falsy_class_group, classes)}
+  end
+
+  defp resolve_dynamic_class_group(class_group, classes) do
+    resolve_class_names(class_group, classes)
+  end
 
   defp resolve_dynamic_class_groups([class_group | rest], classes, acc, count) do
     resolve_dynamic_class_groups(
@@ -320,15 +366,17 @@ defmodule PhoenixAssetPipeline.Helpers do
 
   defp resolve_dynamic_class_groups([], _, acc, count), do: {:lists.reverse(acc), count}
 
-  defp resolve_dynamic_class_group({:choice, truthy_class_group, falsy_class_group}, classes) do
-    {:choice, resolve_class_names(truthy_class_group, classes), resolve_class_names(falsy_class_group, classes)}
-  end
-
-  defp resolve_dynamic_class_group(class_group, classes) do
-    resolve_class_names(class_group, classes)
-  end
-
   defp resolved_class_descriptor(descriptor_key), do: find!(:class_descriptors, descriptor_key)
+
+  defp split_fragment(path) do
+    case :binary.match(path, "#") do
+      {index, 1} ->
+        {binary_part(path, 0, index), binary_part(path, index, byte_size(path) - index)}
+
+      :nomatch ->
+        {path, ""}
+    end
+  end
 
   defp src(path) do
     endpoint = Config.endpoint!()
@@ -344,60 +392,6 @@ defmodule PhoenixAssetPipeline.Helpers do
 
     Map.fetch!(urls, source_path) <> fragment
   end
-
-  defp asset_url(endpoint, static_url, path) do
-    if local_static_url?(static_url),
-      do: endpoint.static_path(path),
-      else: static_url <> endpoint.static_path(path)
-  end
-
-  defp cache_asset_urls(key, digest, endpoint) do
-    static_url = endpoint.static_url()
-
-    urls =
-      :image_sources
-      |> Manifest.get(%{})
-      |> put_asset_urls(%{}, endpoint, static_url)
-
-    urls =
-      :script_tags
-      |> Manifest.get(%{})
-      |> put_asset_urls(urls, endpoint, static_url)
-
-    :persistent_term.put(key, {digest, urls})
-    urls
-  end
-
-  defp put_asset_urls(entries, urls, endpoint, static_url) do
-    Enum.reduce(entries, urls, fn
-      {_, %{path: path, placeholder_path: placeholder_path}}, urls ->
-        urls
-        |> Map.put(path, asset_url(endpoint, static_url, path))
-        |> Map.put(placeholder_path, asset_url(endpoint, static_url, placeholder_path))
-
-      {_, %{path: path}}, urls ->
-        Map.put(urls, path, asset_url(endpoint, static_url, path))
-    end)
-  end
-
-  defp split_fragment(path) do
-    case :binary.match(path, "#") do
-      {index, 1} ->
-        {binary_part(path, 0, index), binary_part(path, index, byte_size(path) - index)}
-
-      :nomatch ->
-        {path, ""}
-    end
-  end
-
-  defp local_static_url?("http://localhost" <> rest), do: local_static_url_suffix?(rest)
-  defp local_static_url?("https://localhost" <> rest), do: local_static_url_suffix?(rest)
-  defp local_static_url?(_), do: false
-
-  defp local_static_url_suffix?(""), do: true
-  defp local_static_url_suffix?("/" <> _), do: true
-  defp local_static_url_suffix?(":" <> _), do: true
-  defp local_static_url_suffix?(_), do: false
 
   defp srcset([_ | _] = srcset) do
     srcset
@@ -424,13 +418,6 @@ defmodule PhoenixAssetPipeline.Helpers do
     case :binary.match(part, [" ", "\t"]) do
       :nomatch -> {part, ""}
       {index, 1} -> {binary_part(part, 0, index), binary_part(part, index, byte_size(part) - index)}
-    end
-  end
-
-  defp asset_path(path) do
-    case :binary.match(path, ["://", "?", "#"]) do
-      :nomatch -> {path, ""}
-      _ -> uri_path(URI.parse(path))
     end
   end
 

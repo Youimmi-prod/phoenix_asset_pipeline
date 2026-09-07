@@ -39,19 +39,19 @@ defmodule PhoenixAssetPipeline.HTML.ClassAttrs do
     end
   end
 
+  defp expression_meta(value_meta, attr_meta) do
+    %{
+      column: value_meta[:column] || attr_meta[:column] || 1,
+      line: value_meta[:line] || attr_meta[:line] || 1
+    }
+  end
+
   defp parse_expression!(value, meta, file) do
     Code.string_to_quoted!(value,
       column: meta[:column] || 1,
       file: file,
       line: meta[:line] || 1
     )
-  end
-
-  defp expression_meta(value_meta, attr_meta) do
-    %{
-      column: value_meta[:column] || attr_meta[:column] || 1,
-      line: value_meta[:line] || attr_meta[:line] || 1
-    }
   end
 
   defp rewrite(%Parser{} = parser, env, file) do
@@ -106,6 +106,12 @@ defmodule PhoenixAssetPipeline.HTML.ClassAttrs do
     Enum.map(attrs, &rewrite_attribute(&1, env, file))
   end
 
+  defp rewrite_eex_clauses(clauses, env, file) do
+    Enum.map(clauses, fn {nodes, expression, meta} ->
+      {rewrite_nodes(nodes, env, file), expression, meta}
+    end)
+  end
+
   defp rewrite_node({:block, type, name, attrs, children, meta, close_meta}, env, file) do
     {:block, type, name, rewrite_attributes(attrs, env, file), rewrite_nodes(children, env, file), meta, close_meta}
   end
@@ -124,10 +130,16 @@ defmodule PhoenixAssetPipeline.HTML.ClassAttrs do
     Enum.map(nodes, &rewrite_node(&1, env, file))
   end
 
-  defp rewrite_eex_clauses(clauses, env, file) do
-    Enum.map(clauses, fn {nodes, expression, meta} ->
-      {rewrite_nodes(nodes, env, file), expression, meta}
-    end)
+  defp rewrite_root_entries(entries, env) do
+    {entries, changed?} =
+      Enum.map_reduce(entries, false, fn entry, changed? ->
+        case rewrite_root_entry(entry, env) do
+          {:changed, entry} -> {entry, true}
+          {:same, entry} -> {entry, changed?}
+        end
+      end)
+
+    if changed?, do: {:ok, entries}, else: :error
   end
 
   defp rewrite_root_entry({key, value} = entry, env) when is_atom(key) or is_binary(key) do
@@ -154,16 +166,4 @@ defmodule PhoenixAssetPipeline.HTML.ClassAttrs do
   end
 
   defp rewrite_root_expression(_, _), do: :error
-
-  defp rewrite_root_entries(entries, env) do
-    {entries, changed?} =
-      Enum.map_reduce(entries, false, fn entry, changed? ->
-        case rewrite_root_entry(entry, env) do
-          {:changed, entry} -> {entry, true}
-          {:same, entry} -> {entry, changed?}
-        end
-      end)
-
-    if changed?, do: {:ok, entries}, else: :error
-  end
 end

@@ -58,8 +58,6 @@ defmodule PhoenixAssetPipeline.Plug do
   @endpoint_urls_missing :__phoenix_asset_pipeline_endpoint_urls_missing__
   @header_cache_missing :__phoenix_asset_pipeline_header_cache_missing__
 
-  def init(action), do: action
-
   def call(conn, action) when is_atom(action) do
     apply(__MODULE__, action, [conn, []])
   end
@@ -105,6 +103,8 @@ defmodule PhoenixAssetPipeline.Plug do
   end
 
   def early_hints(conn, _), do: conn
+
+  def init(action), do: action
 
   @doc """
   Captures the current manifest for the lifetime of a request.
@@ -194,37 +194,36 @@ defmodule PhoenixAssetPipeline.Plug do
     end
   end
 
-  defp content_security_policy(conn) do
-    if html_response?(conn) and not csp_status_skipped?(conn.status),
-      do: put_content_security_policy_header(conn),
-      else: conn
+  defp append_configured_early_hint(acc, {link, attrs}, static_url) when is_binary(link) and is_list(attrs) do
+    [
+      acc,
+      @early_hints_preload_prefix,
+      static_url,
+      link,
+      ?>,
+      early_hint_attrs(attrs)
+    ]
   end
 
-  defp csp_map([@content_security_policy | _]), do: @content_security_policy_map
-  defp csp_map([csp | _]), do: parse_csp(csp)
-  defp csp_map(_), do: %{}
+  defp append_configured_early_hint(acc, _, _), do: acc
 
-  defp csp_skipped?(path_info) do
-    Enum.any?(@csp_skip_path_prefixes, &List.starts_with?(path_info, &1))
+  defp append_configured_early_hints(acc, [link | rest], static_url) do
+    acc
+    |> append_configured_early_hint(link, static_url)
+    |> append_configured_early_hints(rest, static_url)
   end
 
-  defp csp_status_skipped?(status) when is_integer(status) do
-    Enum.any?(@csp_skip_statuses, &status_skipped?(&1, status))
+  defp append_configured_early_hints(acc, [], _), do: acc
+
+  defp append_configured_early_hints(acc, link, static_url) do
+    append_configured_early_hint(acc, link, static_url)
   end
 
-  defp csp_status_skipped?(_), do: false
-
-  defp decode_json(nil, _), do: :error
-
-  defp decode_json(json_library, body) do
-    if Code.ensure_loaded?(json_library) and function_exported?(json_library, :try_decode, 2) do
-      json_library.try_decode(body, [:use_nil])
-    else
-      {:ok, json_library.decode!(body)}
-    end
-  rescue
-    _ -> :error
+  defp append_early_hints([preload | rest], static_url, acc) do
+    append_early_hints(rest, static_url, [acc, @early_hints_preload_prefix, static_url, preload])
   end
+
+  defp append_early_hints([], _, acc), do: acc
 
   defp cached_early_hints(endpoint, static_url, preloads, links) do
     key = {__MODULE__, :early_hints, endpoint}
@@ -245,6 +244,50 @@ defmodule PhoenixAssetPipeline.Plug do
         link
     end
   end
+
+  defp content_security_policy(conn) do
+    if html_response?(conn) and not csp_status_skipped?(conn.status),
+      do: put_content_security_policy_header(conn),
+      else: conn
+  end
+
+  defp csp_map([@content_security_policy | _]), do: @content_security_policy_map
+  defp csp_map([csp | _]), do: parse_csp(csp)
+  defp csp_map(_), do: %{}
+
+  defp csp_skipped?(path_info) do
+    Enum.any?(@csp_skip_path_prefixes, &List.starts_with?(path_info, &1))
+  end
+
+  defp csp_status_skipped?(status) when is_integer(status) do
+    Enum.any?(@csp_skip_statuses, &status_skipped?(&1, status))
+  end
+
+  defp csp_status_skipped?(_), do: false
+
+  defp csp_style_src([]), do: []
+  defp csp_style_src(values), do: [@content_security_policy_style_src, csp_values(values)]
+
+  defp csp_values([value | values]), do: [?\s, value | csp_values(values)]
+  defp csp_values([]), do: []
+  defp decode_json(nil, _), do: :error
+
+  defp decode_json(json_library, body) do
+    if Code.ensure_loaded?(json_library) and function_exported?(json_library, :try_decode, 2) do
+      json_library.try_decode(body, [:use_nil])
+    else
+      {:ok, json_library.decode!(body)}
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp early_hint_attr({_, false}), do: []
+  defp early_hint_attr({_, nil}), do: []
+  defp early_hint_attr({name, true}), do: ["; ", to_string(name)]
+  defp early_hint_attr({name, value}), do: ["; ", to_string(name), "=", to_string(value)]
+
+  defp early_hint_attrs(attrs), do: Enum.map(attrs, &early_hint_attr/1)
 
   defp endpoint_urls(endpoint) do
     key = {__MODULE__, :endpoint_urls, endpoint}
@@ -271,48 +314,29 @@ defmodule PhoenixAssetPipeline.Plug do
     end
   end
 
-  defp early_hint_attr({_, false}), do: []
-  defp early_hint_attr({_, nil}), do: []
-  defp early_hint_attr({name, true}), do: ["; ", to_string(name)]
-  defp early_hint_attr({name, value}), do: ["; ", to_string(name), "=", to_string(value)]
+  defp generic_content_security_policy(headers, static_url, directives) do
+    directives =
+      Map.put(directives, "img-src", [static_url])
 
-  defp early_hint_attrs(attrs), do: Enum.map(attrs, &early_hint_attr/1)
-
-  defp append_early_hints([preload | rest], static_url, acc) do
-    append_early_hints(rest, static_url, [acc, @early_hints_preload_prefix, static_url, preload])
+    headers
+    |> csp_map()
+    |> Map.merge(directives, fn _, v1, v2 -> v1 ++ v2 end)
+    |> Enum.reduce([], fn
+      {directive, values}, acc -> [directive <> " " <> Enum.join(values, " ") | acc]
+      _, acc -> acc
+    end)
+    |> Enum.sort()
+    |> Enum.join("; ")
   end
-
-  defp append_early_hints([], _, acc), do: acc
-
-  defp append_configured_early_hints(acc, [link | rest], static_url) do
-    acc
-    |> append_configured_early_hint(link, static_url)
-    |> append_configured_early_hints(rest, static_url)
-  end
-
-  defp append_configured_early_hints(acc, [], _), do: acc
-
-  defp append_configured_early_hints(acc, link, static_url) do
-    append_configured_early_hint(acc, link, static_url)
-  end
-
-  defp append_configured_early_hint(acc, {link, attrs}, static_url) when is_binary(link) and is_list(attrs) do
-    [
-      acc,
-      @early_hints_preload_prefix,
-      static_url,
-      link,
-      ?>,
-      early_hint_attrs(attrs)
-    ]
-  end
-
-  defp append_configured_early_hint(acc, _, _), do: acc
 
   defp html_response?(conn) do
     conn
     |> get_resp_header("content-type")
     |> Enum.any?(&String.starts_with?(&1, "text/html"))
+  end
+
+  defp json_library do
+    Application.get_env(:phoenix, :json_library)
   end
 
   defp parse_csp(value) do
@@ -325,15 +349,6 @@ defmodule PhoenixAssetPipeline.Plug do
       end
     end)
   end
-
-  defp json_library do
-    Application.get_env(:phoenix, :json_library)
-  end
-
-  defp status_skipped?(%Range{} = range, status), do: status in range
-  defp status_skipped?(statuses, status) when is_list(statuses), do: status in statuses
-  defp status_skipped?(status, status), do: true
-  defp status_skipped?(_, _), do: false
 
   defp put_content_security_policy_header(conn) do
     directives = Manifest.get(:csp_directives, %{})
@@ -375,24 +390,8 @@ defmodule PhoenixAssetPipeline.Plug do
     end
   end
 
-  defp generic_content_security_policy(headers, static_url, directives) do
-    directives =
-      Map.put(directives, "img-src", [static_url])
-
-    headers
-    |> csp_map()
-    |> Map.merge(directives, fn _, v1, v2 -> v1 ++ v2 end)
-    |> Enum.reduce([], fn
-      {directive, values}, acc -> [directive <> " " <> Enum.join(values, " ") | acc]
-      _, acc -> acc
-    end)
-    |> Enum.sort()
-    |> Enum.join("; ")
-  end
-
-  defp csp_style_src([]), do: []
-  defp csp_style_src(values), do: [@content_security_policy_style_src, csp_values(values)]
-
-  defp csp_values([value | values]), do: [?\s, value | csp_values(values)]
-  defp csp_values([]), do: []
+  defp status_skipped?(%Range{} = range, status), do: status in range
+  defp status_skipped?(statuses, status) when is_list(statuses), do: status in statuses
+  defp status_skipped?(status, status), do: true
+  defp status_skipped?(_, _), do: false
 end

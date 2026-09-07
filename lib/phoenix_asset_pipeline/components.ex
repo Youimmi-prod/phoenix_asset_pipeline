@@ -56,44 +56,26 @@ defmodule PhoenixAssetPipeline.Components do
     assigns =
       assign(assigns,
         avif_srcset: avif_srcset,
-        img_class: [class("col-start-1 row-start-1"), assigns.img_class],
-        placeholder_src: image_placeholder(png_src),
         png_src: png_src,
         png_srcset: png_srcset,
         webp_srcset: webp_srcset
       )
 
     ~H"""
-    <span
-      class={@class}
-      id={@id}
-      phx-update={@phx_update}
-    >
-      <span class={class("inline-grid")}>
-        <img
-          alt=""
-          class={@img_class}
-          height={@height}
-          loading={@loading}
-          src={@placeholder_src}
-          width={@width}
-        />
-        <picture class={class("contents")}>
-          {source(srcset: @avif_srcset, type: "image/avif")}
-          {source(srcset: @webp_srcset, type: "image/webp")}
-          {img(@png_src,
-            alt: @alt,
-            class: @img_class,
-            decoding: @decoding,
-            fetchpriority: @fetchpriority,
-            height: @height,
-            loading: @loading,
-            srcset: @png_srcset,
-            width: @width
-          )}
-        </picture>
-      </span>
-    </span>
+    <picture class={@class} id={@id} phx-update={@phx_update}>
+      {source(srcset: @avif_srcset, type: "image/avif")}
+      {source(srcset: @webp_srcset, type: "image/webp")}
+      {img(@png_src,
+        alt: @alt,
+        class: @img_class,
+        decoding: @decoding,
+        fetchpriority: @fetchpriority,
+        height: @height,
+        loading: @loading,
+        srcset: @png_srcset,
+        width: @width
+      )}
+    </picture>
     """
   end
 

@@ -9,11 +9,6 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
   @missing :__phoenix_asset_pipeline_module_classes_missing__
 
   @doc false
-  def mapping_path do
-    Path.join([Config.manifest_cache_dir(), project_app(), @mapping_file])
-  end
-
-  @doc false
   def ensure_prepared! do
     path = mapping_path()
     key = persistent_key(path)
@@ -33,6 +28,25 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
   end
 
   @doc false
+  def fixed_mappings!(class_names) when is_list(class_names) do
+    class_names = Enum.uniq(class_names)
+    mappings = Map.take(current_mappings(), class_names)
+
+    if map_size(mappings) == length(class_names) do
+      mappings
+    else
+      prepare!(:stable)
+      mappings = current_mappings()
+      Map.new(class_names, fn class_name -> {class_name, Map.fetch!(mappings, class_name)} end)
+    end
+  end
+
+  @doc false
+  def mapping_path do
+    Path.join([Config.manifest_cache_dir(), project_app(), @mapping_file])
+  end
+
+  @doc false
   def prepare!(mode \\ :deterministic) when mode in [:deterministic, :stable] do
     path = mapping_path()
 
@@ -42,14 +56,6 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
       [node()],
       :infinity
     )
-  end
-
-  @doc false
-  def fixed_mappings!(class_names) when is_list(class_names) do
-    class_names = class_names |> Enum.uniq() |> Enum.sort()
-    mappings = current_mappings()
-
-    Map.new(class_names, fn class_name -> {class_name, Map.fetch!(mappings, class_name)} end)
   end
 
   defp add_class_count(class_name, counts) do
@@ -63,15 +69,6 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
     end
   end
 
-  defp build_mappings(counts, previous, :stable) do
-    seed = Map.filter(previous, fn {class_name, _} -> Map.has_key?(counts, class_name) end)
-    allocate_mappings(counts, seed)
-  end
-
-  defp build_mappings(counts, _, :deterministic) do
-    allocate_mappings(counts, %{})
-  end
-
   defp allocate_mappings(counts, seed) do
     short_names = reverse_mappings!(seed)
 
@@ -81,6 +78,21 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
       allocate_class(class_name, state)
     end)
     |> elem(0)
+  end
+
+  defp build_mappings(counts, previous, :stable) do
+    seed = Map.filter(previous, fn {class_name, _} -> Map.has_key?(counts, class_name) end)
+    allocate_mappings(counts, seed)
+  end
+
+  defp build_mappings(counts, _, :deterministic) do
+    allocate_mappings(counts, %{})
+  end
+
+  defp choice_counts(truthy, falsy, condition, counts) do
+    if literal_group?(truthy) and literal_group?(falsy),
+      do: valid_choice_counts(truthy, falsy, condition, counts),
+      else: counts
   end
 
   defp class_base("phx-" <> _ = class_name) do
@@ -147,33 +159,6 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
 
   defp class_whitespace?(byte), do: byte in [?\s, ?\t, ?\n, ?\r, ?\f]
 
-  defp skip_class_whitespace(classes, index, size) when index < size do
-    if class_whitespace?(:binary.at(classes, index)),
-      do: skip_class_whitespace(classes, index + 1, size),
-      else: index
-  end
-
-  defp skip_class_whitespace(_, index, _), do: index
-
-  defp choice_counts(truthy, falsy, condition, counts) do
-    if literal_group?(truthy) and literal_group?(falsy),
-      do: valid_choice_counts(truthy, falsy, condition, counts),
-      else: counts
-  end
-
-  defp valid_choice_counts(truthy, _, true, counts), do: class_group_counts(truthy, counts)
-
-  defp valid_choice_counts(_, falsy, condition, counts) when condition in [false, nil] do
-    class_group_counts(falsy, counts)
-  end
-
-  defp valid_choice_counts(truthy, falsy, {_, _, _}, counts) do
-    counts = class_group_counts(truthy, counts)
-    class_group_counts(falsy, counts)
-  end
-
-  defp valid_choice_counts(_, _, _, counts), do: counts
-
   defp conditional_counts(classes, true, counts) do
     if literal_group?(classes), do: class_group_counts(classes, counts), else: counts
   end
@@ -226,14 +211,6 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
     mappings
   end
 
-  defp persistent_key(path), do: {__MODULE__, path}
-
-  defp project_app do
-    app = if config = mix_project_config(), do: config[:app]
-
-    to_string(app || Config.otp_app())
-  end
-
   defp mix_project_config do
     if Code.ensure_loaded?(Mix.Project) do
       case Mix.Project.config() do
@@ -246,6 +223,8 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
   catch
     :exit, _ -> nil
   end
+
+  defp persistent_key(path), do: {__MODULE__, path}
 
   defp prefix(class_name) do
     class_name
@@ -287,6 +266,12 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
     else
       prepare_locked(path, :stable)
     end
+  end
+
+  defp project_app do
+    app = if config = mix_project_config(), do: config[:app]
+
+    to_string(app || Config.otp_app())
   end
 
   defp put_allocated_class(class_name, base, mappings, short_names, count) do
@@ -343,6 +328,14 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
     end)
   end
 
+  defp skip_class_whitespace(classes, index, size) when index < size do
+    if class_whitespace?(:binary.at(classes, index)),
+      do: skip_class_whitespace(classes, index + 1, size),
+      else: index
+  end
+
+  defp skip_class_whitespace(_, index, _), do: index
+
   defp source_files do
     paths =
       if config = mix_project_config(),
@@ -367,6 +360,19 @@ defmodule PhoenixAssetPipeline.HTML.ModuleClasses do
         :error
     end
   end
+
+  defp valid_choice_counts(truthy, _, true, counts), do: class_group_counts(truthy, counts)
+
+  defp valid_choice_counts(_, falsy, condition, counts) when condition in [false, nil] do
+    class_group_counts(falsy, counts)
+  end
+
+  defp valid_choice_counts(truthy, falsy, {_, _, _}, counts) do
+    counts = class_group_counts(truthy, counts)
+    class_group_counts(falsy, counts)
+  end
+
+  defp valid_choice_counts(_, _, _, counts), do: counts
 
   defp valid_mappings?(mappings) do
     Enum.all?(mappings, fn {class_name, short_name} ->
