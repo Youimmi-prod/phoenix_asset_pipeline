@@ -9,12 +9,12 @@ defmodule PhoenixAssetPipeline.Assets.Images do
 
   @cache_file "image_assets.term"
   @image_exts ~w(.avif .jpeg .jpg .png .webp)
-  @png_options [compression: 9, strip: true]
-  @placeholder_png_options [Q: 80, compression: 9, dither: 0, palette: true, strip: true]
-  @avif_options [compression: :VIPS_FOREIGN_HEIF_COMPRESSION_AV1, effort: 9, strip: true]
+  @png_options [compression: 9, keep: [:VIPS_FOREIGN_KEEP_NONE]]
+  @placeholder_png_options [Q: 80, compression: 9, dither: 0, palette: true, keep: [:VIPS_FOREIGN_KEEP_NONE]]
+  @avif_options [compression: :VIPS_FOREIGN_HEIF_COMPRESSION_AV1, effort: 9, keep: [:VIPS_FOREIGN_KEEP_NONE]]
   @avif_1x_options [Q: 82] ++ @avif_options
   @avif_high_density_options [Q: 55] ++ @avif_options
-  @webp_options [Q: 88, strip: true]
+  @webp_options [Q: 88, keep: [:VIPS_FOREIGN_KEEP_NONE]]
   @placeholder_script ~S"""
   const maxPixels = Number(process.env.PHOENIX_ASSET_PIPELINE_IMAGE_MAX_PIXELS);
   const paths = process.env.PHOENIX_ASSET_PIPELINE_IMAGE_PATHS.split("\n");
