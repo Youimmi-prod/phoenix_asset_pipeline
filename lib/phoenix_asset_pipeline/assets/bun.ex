@@ -16,6 +16,19 @@ defmodule PhoenixAssetPipeline.Assets.Bun do
   const entries = (name) => (process.env[name] || "").split("\n").filter(Boolean);
   const dropJs = entries("PHOENIX_ASSET_PIPELINE_JS_DROP");
   const buildSvg = process.env.PHOENIX_ASSET_PIPELINE_SVG === "1";
+  const svgoOptions = {
+    multipass: true,
+    plugins: [{
+      name: "preset-default",
+      params: {
+        overrides: {
+          convertPathData: { applyTransforms: false },
+          convertTransform: false,
+          moveGroupAttrsToElems: false
+        }
+      }
+    }]
+  };
   const spriteGroupEntries = [];
   const spriteSourceEntries = [];
 
@@ -150,7 +163,7 @@ defmodule PhoenixAssetPipeline.Assets.Bun do
   const optimizeSvg = async (filePath) => {
     const { optimize } = await import("svgo");
     const result = optimize(await Bun.file(filePath).text(), {
-      multipass: true,
+      ...svgoOptions,
       path: filePath
     });
 
@@ -180,7 +193,7 @@ defmodule PhoenixAssetPipeline.Assets.Bun do
     return create({
       dest: ".",
       shape: {
-        transform: [{ svgo: { multipass: true } }]
+        transform: [{ svgo: svgoOptions }]
       },
       svg: {
         dimensionAttributes: false,

@@ -3,7 +3,8 @@
 ## 4.0.0
 
 - Remove image placeholders from `<.picture>`
-- Strip metadata from generated images
+- Strip metadata from generated images, including PNG resolution (`pHYs`)
+- Preserve SVG transforms and their precision during optimization of standalone files and sprites
 - Update Brotli to 9.0 and Bun to 1.4.2
 - Replace `:manifest_mode` with `:precompiled_manifest` (default `false`); enable it for production
 - Fix development reloads, HTTP ranges and conditional requests, HEEx `noformat`, and class formatting

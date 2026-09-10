@@ -173,6 +173,21 @@ defmodule PhoenixAssetPipeline.Assets.Images do
     path |> Path.extname() |> String.downcase() |> Kernel.in(@image_exts)
   end
 
+  # libvips writes pHYs even with keep: none. Stop before the compressed image data.
+  defp strip_png_resolution(content, offset \\ 8) do
+    case binary_part(content, offset, 8) do
+      <<9::32, "pHYs">> ->
+        binary_part(content, 0, offset) <>
+          binary_part(content, offset + 21, byte_size(content) - offset - 21)
+
+      <<_::32, "IDAT">> ->
+        content
+
+      <<size::32, _::32>> ->
+        strip_png_resolution(content, offset + size + 12)
+    end
+  end
+
   defp write_avif!(image, opts) do
     case Operation.heifsave_buffer(image, opts) do
       {:ok, content} -> content
@@ -182,6 +197,7 @@ defmodule PhoenixAssetPipeline.Assets.Images do
 
   defp write_image!(image, suffix, opts) do
     case Image.write_to_buffer(image, suffix, opts) do
+      {:ok, content} when suffix == ".png" -> strip_png_resolution(content)
       {:ok, content} -> content
       {:error, reason} -> raise "could not write #{suffix} image: #{inspect(reason)}"
     end
